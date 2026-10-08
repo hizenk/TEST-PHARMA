@@ -77,13 +77,27 @@ Sur Mac : clic droit sur le fichier, puis *Ouvrir avec* > *Microsoft Excel*.
 
 ### Prévision du mois suivant
 
-1. Six méthodes simples sont comparées : prévision naïve, même mois l'an dernier,
-   moyennes mobiles, saisonnalité × niveau, régression tendance + mois.
-2. Chaque méthode ne voit que les mois qui précèdent le mois prévu.
-3. La méthode de chaque groupe est choisie sur 12 mois de validation, puis
-   jugée sur les 12 mois suivants, qu'elle n'a jamais vus.
-4. Verdict « Oui » si elle fait au moins 15 % d'erreur en moins que la
-   prévision naïve, c'est-à-dire refaire les ventes du mois précédent.
+Neuf techniques, en trois familles, sont comparées :
+
+| Famille | Technique | Ce qu'elle capte | Comment elle prévoit le mois suivant | Adaptée quand |
+|---|---|---|---|---|
+| Naïve | Même mois an dernier | Saisonnalité | Reprend la valeur du même mois, un an avant | Saison marquée, niveau stable |
+| Naïve | Dernier mois | Niveau récent | Reprend la valeur du mois précédent | Série lisse, sans saison |
+| Régression | Tendance seule | Tendance | Prolonge une droite ajustée sur tout l'historique | Hausse ou baisse régulière, sans saison |
+| Régression | Saisonnalité seule | Saisonnalité | Moyenne historique du mois visé | Saison stable, pas de tendance |
+| Régression | Tendance + saisonnalité | Les deux | Droite + écart habituel du mois visé | Tendance régulière et saison stable |
+| Lissage | Simple | Niveau | Moyenne pondérée, les mois récents pèsent plus | Ni tendance ni saison, niveau qui dérive |
+| Lissage | Holt | Niveau + tendance | Niveau récent + pente récente | Tendance qui change en cours de route |
+| Lissage | Holt-Winters sans tendance | Niveau + saisonnalité | Niveau récent + écart saisonnier récent | Saison marquée, niveau qui dérive |
+| Lissage | Holt-Winters | Niveau + tendance + saisonnalité | Niveau + pente + écart saisonnier, tous récents | Tendance et saison qui évoluent |
+
+Protocole :
+1. Chaque technique ne voit que les mois qui précèdent le mois prévu. Les
+   paramètres des lissages sont réajustés à chaque mois, sur une grille.
+2. La technique de chaque groupe est choisie sur 12 mois de validation.
+3. Elle est ensuite jugée sur les 12 mois suivants, jamais vus pendant le
+   choix, face à « Naïve · Dernier mois », la prévision la plus simple.
+4. Verdict « Oui » si l'erreur moyenne baisse d'au moins 15 %.
 
 ### Source externe
 

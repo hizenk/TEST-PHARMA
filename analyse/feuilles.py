@@ -9,7 +9,7 @@ from .externe import SEUIL_EPIDEMIE, SOURCE, URL
 from .mise_en_forme import (F_DATE, F_DATE_HEURE, F_ENTIER, F_INDICE, F_PCT, F_PCT1, F_QTE, F_QTE1, GRIS, ORANGE_PALE,
                             VERT, VERT_BARRE, VERT_FONCE, VERT_PALE, barres, bloc, echelle_divergente, ecrire,
                             titre_feuille)
-from .prevision import METHODES, N_TEST, N_VALIDATION, SEUIL_OUI
+from .prevision import METHODES, N_TEST, N_VALIDATION, REFERENCE, SEUIL_OUI, libelle
 from .statistiques import MOIS
 
 PALETTE = ["#2A78D6", "#EB6834", "#1BAF7A"]  # 3 premières couleurs catégorielles (lisibles par les daltoniens)
@@ -122,7 +122,8 @@ def synthese(ws, st, d, stats, prev, ext, genere_le):
     sensibles = sensibles.sort_values("Écart en épidémie, à saison égale (nov. → mars)", ascending=False)
     grippe_txt = liste(f"{NOMS.get(c, c)} ({c}) {pct(sensibles.at[c, 'Écart en épidémie, à saison égale (nov. → mars)'])}"
                        for c in sensibles.index)
-    non = [c for c in res.index if res.at[c, "Prévisible ?"] != "Oui"]
+    faible = [c for c in res.index if res.at[c, "Prévisible ?"] == "Gain faible"]
+    aucun = [c for c in res.index if res.at[c, "Prévisible ?"] == "Non"]
     mensuel = d.controles.loc["Mensuel = journalier (somme par mois)"]
 
     ligne = entete(ws, st, ligne, "Ce qu'il faut retenir")
@@ -143,10 +144,15 @@ def synthese(ws, st, d, stats, prev, ext, genere_le):
         f"Heures : la tranche {tranche} concentre {pct(heures.max(), False)} des ventes de la journée.",
         (f"Environnement : pendant les semaines d'épidémie de grippe (au moins {SEUIL_EPIDEMIE} cas pour 100 000 "
          f"habitants, réseau Sentinelles), et à saison égale, les ventes augmentent pour {grippe_txt}."),
-        (f"Prévision du mois suivant : oui pour {liste(f'{NOMS.get(c, c)} ({c})' for c in oui)} ; "
-         f"pas mieux que la prévision naïve pour {liste(f'{NOMS.get(c, c)} ({c})' for c in non)}. "
-         f"Réponse : « pour certains médicaments seulement »." if oui and non else
-         f"Prévision du mois suivant : {'oui pour tous les groupes' if oui else 'non, pas mieux que la prévision naïve'}."),
+        ("Prévision du mois suivant (9 techniques testées) : "
+         + " ; ".join(x for x in (
+             f"oui pour {liste(f'{NOMS.get(c, c)} ({c})' for c in oui)}" if oui else "",
+             (f"gain faible, moins de {pct(SEUIL_OUI, False)}, pour {liste(f'{NOMS.get(c, c)} ({c})' for c in faible)}"
+              if faible else ""),
+             f"pas mieux que la prévision naïve pour {liste(f'{NOMS.get(c, c)} ({c})' for c in aucun)}" if aucun else "",
+         ) if x)
+         + (". Réponse : « pour certains médicaments seulement »." if oui and (faible or aucun) else
+            (". Réponse : oui." if oui else ". Réponse : non."))),
     ]
     ligne = lignes_texte(ws, st, ligne, [f"{i}. {t}" for i, t in enumerate(retenir, 1)], puce="")
 
@@ -161,7 +167,7 @@ def synthese(ws, st, d, stats, prev, ext, genere_le):
          f"{liste(f'{NOMS.get(c, c)} ({c})' for c in sensibles.index)}."),
         "Calculer les quantités à commander avec le bloc ⑤ « Tableau des achats » de l'onglet Tableau de bord.",
         (f"Pour {liste(oui)}, s'appuyer sur la prévision du mois suivant (onglet Prévision) ; "
-         f"pour les autres groupes, la moyenne récente reste la meilleure référence."),
+         f"pour les autres groupes, les ventes du mois précédent restent la meilleure référence."),
     ]
     proprietaire = [
         (f"Renforcer l'équipe sur la tranche {tranche} ({pct(heures.max(), False)} des ventes)"
@@ -277,33 +283,54 @@ def graphe_saisonnalite(wb, ws, d, p_saison, ligne_graphe):
 
 # ---------------------------------------------------------------------- Prévision
 def prevision(ws, st, prev):
-    ws.set_column(1, 1, 40)
-    ws.set_column(2, 2, 36)
-    ws.set_column(3, 9, 15)
+    for col, largeur in ((1, 38), (2, 14), (3, 28)):
+        ws.set_column(col, col, largeur)
+    ws.set_column(4, 10, 15)
     v0, v1 = prev["validation"]
     t0, t1 = prev["test"]
+    ref = libelle(REFERENCE)
     ligne = titre_feuille(ws, st, "Peut-on prévoir les ventes du mois suivant ?",
-                          f"Test sur {N_TEST} mois non utilisés pour construire les prévisions "
-                          f"({mois_txt(t0)} → {mois_txt(t1)}), face à la prévision la plus simple", derniere_col=9)
-    ligne = entete(ws, st, ligne, "Méthode", derniere_col=9)
-    methode = [
+                          f"9 techniques testées sur {N_TEST} mois non utilisés pour construire les prévisions "
+                          f"({mois_txt(t0)} → {mois_txt(t1)}), face à la prévision la plus simple ({ref})",
+                          derniere_col=9)
+
+    # Les 9 techniques, en trois familles
+    ligne = entete(ws, st, ligne, "Les 9 techniques comparées", derniere_col=9)
+    colonnes = [((1, 1), "Famille"), ((2, 3), "Technique"), ((4, 5), "Ce qu'elle capte"),
+                ((6, 7), "Comment elle prévoit le mois suivant"), ((8, 9), "Adaptée quand")]
+    for (c0, c1), titre in colonnes:
+        if c0 == c1:
+            ws.write(ligne, c0, titre, st.colonne)
+        else:
+            ws.merge_range(ligne, c0, ligne, c1, titre, st.colonne)
+    ws.set_row(ligne, 20)
+    texte = st(text_wrap=True, valign="top")
+    for i, (famille, technique, capte, comment, quand) in enumerate(METHODES.values(), start=1):
+        r = ligne + i
+        ws.write(r, 1, famille, st(bold=True, valign="top", font_color=VERT_FONCE))
+        for (c0, c1), valeur in zip([c for c, _ in colonnes[1:]], (technique, capte, comment, quand)):
+            ws.merge_range(r, c0, r, c1, valeur, st(text_wrap=True, valign="top", bold=c0 == 2))
+        ws.set_row(r, 30)
+    ligne += len(METHODES) + 2
+
+    ligne = entete(ws, st, ligne, "Protocole du test", derniere_col=9)
+    protocole = [
         (f"Séries : ventes mensuelles de chaque groupe sur les {prev['nb_mois']} mois complets, recalculées depuis "
          "l'export journalier."),
-        ("Origine glissante : pour prévoir un mois, chaque méthode n'utilise que les mois qui le précèdent, comme "
-         "en situation réelle."),
-        (f"Choix de la méthode sur {N_VALIDATION} mois de validation ({mois_txt(v0)} → {mois_txt(v1)}), puis "
-         f"jugement sur les {N_TEST} mois de test suivants, jamais vus pendant le choix."),
-        ("Référence : la prévision naïve (les ventes du mois précédent), celle que n'importe qui ferait sans analyse. "
-         f"Verdict « Oui » si l'erreur moyenne baisse d'au moins {pct(SEUIL_OUI, False)} par rapport à elle."),
-        "Méthodes comparées : " + "; ".join(METHODES.values()) + ".",
+        ("Origine glissante : pour prévoir un mois, chaque technique n'utilise que les mois qui le précèdent, comme "
+         "en situation réelle (les paramètres des lissages sont réajustés à chaque mois)."),
+        (f"Choix de la technique de chaque groupe sur {N_VALIDATION} mois de validation ({mois_txt(v0)} → "
+         f"{mois_txt(v1)}), puis jugement sur les {N_TEST} mois de test suivants, jamais vus pendant le choix."),
+        (f"Référence : {ref} (refaire les ventes du mois précédent), la prévision que n'importe qui ferait sans "
+         f"analyse. Verdict « Oui » si l'erreur moyenne baisse d'au moins {pct(SEUIL_OUI, False)} par rapport à elle."),
     ]
-    ligne = lignes_texte(ws, st, ligne, methode, derniere_col=9)
+    ligne = lignes_texte(ws, st, ligne, protocole, derniere_col=9)
 
     res = prev["resultats"].drop(columns=["_retenue", "_rmse"])
     res.index = [nom(c) for c in res.index]
     res.index.name = "Groupe"
     ligne, p = bloc(ws, st, ligne, "Résultats du test", res, {
-        "Gain sur la prévision naïve": F_PCT, "Erreur relative moyenne (test)": F_PCT, "*": F_QTE1}, largeur_titre=9,
+        f"Gain sur {ref}": F_PCT, "Erreur relative moyenne (test)": F_PCT, "*": F_QTE1}, largeur_titre=9,
         note="Erreur moyenne = écart absolu moyen entre prévision et ventes réelles, en unités par mois.")
     col_verdict = 1 + list(res.columns).index("Prévisible ?") + 1
     for valeur, couleur in (("Oui", VERT_BARRE), ("Non", ORANGE_PALE), ("Gain faible", "#FFF2CC")):
@@ -320,13 +347,13 @@ def prevision(ws, st, prev):
     proch.index.name = "Groupe"
     ligne, p = bloc(ws, st, ligne, f"Prévision pour {mois_txt(prev['prochain_mois'])} (mois qui suit le dernier mois complet)",
                     proch, {"*": F_ENTIER}, largeur_titre=9,
-                    note="Fourchette indicative à 80 % tirée des erreurs observées pendant le test. Pour les groupes "
-                         "non prévisibles, la prévision n'est pas plus fiable que la prévision naïve.")
+                    note=f"Fourchette indicative à 80 % tirée des erreurs observées pendant le test. Pour les groupes "
+                         f"non prévisibles, la prévision n'est pas plus fiable que {ref}.")
 
     erreurs = prev["erreurs_test"].copy()
-    erreurs.index.name = "Méthode (erreur moyenne sur le test)"
-    ligne, p = bloc(ws, st, ligne, "Erreur moyenne de chaque méthode sur les mois de test", erreurs, {"*": F_QTE1},
-                    largeur_titre=9)
+    erreurs.index.name = "Technique (erreur moyenne sur le test)"
+    ligne, p = bloc(ws, st, ligne, "Erreur moyenne des 9 techniques sur les mois de test (en vert : la plus faible)",
+                    erreurs, {"*": F_QTE1}, largeur_titre=9)
     for j in range(len(erreurs.columns)):
         ws.conditional_format(p, 2 + j, p + len(erreurs) - 1, 2 + j,
                               {"type": "bottom", "value": 1, "format": st(bg_color=VERT_BARRE, bold=True)})
