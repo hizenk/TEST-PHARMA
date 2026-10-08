@@ -192,13 +192,15 @@ def synthese(ws, st, d, stats, prev, ext, genere_le):
         ("Prévision", f"Test de prévision du mois suivant sur {N_TEST} mois non utilisés, face à la prévision naïve"),
         ("Source externe", "Grippe (réseau Sentinelles) et ventes : ce qui relève de l'environnement"),
         ("État des données", "Quel export pour quoi, contrôles de cohérence, ce qui a été corrigé ou écarté"),
-        ("Pharma_Ventes_Daily", "Données : les quatre exports (journalier, horaire, hebdomadaire, mensuel) et la grippe"),
     ]
     for feuille, description in contenu:
         ws.merge_range(ligne, 1, ligne, 3, "", st())
         ws.write_url(ligne, 1, f"internal:'{feuille}'!A1", st(font_color=VERT, underline=1, bold=True), feuille)
         ws.merge_range(ligne, 4, ligne, 12, description, st(font_color=GRIS))
         ligne += 1
+    ws.merge_range(ligne, 1, ligne, 3, "Pages de données", st(bold=True, font_color=GRIS))
+    ws.merge_range(ligne, 4, ligne, 12, "Masquées (ventes par jour, par heure et grippe, lues par les formules) ; "
+                                        "les exports bruts sont dans le dossier exports/ du dépôt.", st(font_color=GRIS))
 
 
 # ---------------------------------------------------------------------- Statistiques

@@ -46,12 +46,19 @@ def construire(dossier_exports, fichier_externe, sortie, maj_externe=False):
     # Ordre des onglets : analyse d'abord, données ensuite, calculs masqués à la fin
     ws = {nom: wb.add_worksheet(nom) for nom in
           ("Synthèse", "Tableau de bord", "Statistiques", "Prévision", "Source externe", "État des données")}
+    # Pages de données : seulement celles que lisent les formules et les graphiques, masquées.
+    # (Les exports hebdomadaire et mensuel ne servent qu'aux contrôles, faits ici en Python :
+    # ils restent dans le dossier exports/ mais ne sont pas recopiés dans le classeur.)
     colonnes = {}
-    for cle in ("journalier", "horaire", "hebdomadaire", "mensuel"):
+    pages_donnees = []
+    for cle in ("journalier", "horaire"):
         nom_feuille = donnees.EXPORTS[cle][2]
-        colonnes[cle] = feuilles.ecrire_export(wb.add_worksheet(nom_feuille), st, d.exports[cle], nom_feuille)
-    feuilles.ecrire_export(wb.add_worksheet("Grippe_Sentinelles"), st, ext["semaines"].reset_index(),
-                           "Grippe_Sentinelles")
+        page = wb.add_worksheet(nom_feuille)
+        colonnes[cle] = feuilles.ecrire_export(page, st, d.exports[cle], nom_feuille)
+        pages_donnees.append(page)
+    page = wb.add_worksheet("Grippe_Sentinelles")
+    feuilles.ecrire_export(page, st, ext["semaines"].reset_index(), "Grippe_Sentinelles")
+    pages_donnees.append(page)
 
     # Outil de sélection (formules sur les feuilles journalière et horaire)
     jour, horaire = d.exports["journalier"], d.exports["horaire"]
@@ -79,6 +86,8 @@ def construire(dossier_exports, fichier_externe, sortie, maj_externe=False):
     for nom in ("Statistiques", "Prévision", "Source externe", "État des données"):
         ws[nom].set_tab_color(VERT)
     ws["Synthèse"].activate()
+    for page in pages_donnees:
+        page.hide()
     wb.close()
     os.replace(tmp.name, sortie)
 

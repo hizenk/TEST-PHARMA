@@ -21,6 +21,9 @@ TEST-PHARMA/
 ├── interroger_excel.py             # interroge le classeur en live (fichier local ou dépôt git)
 ├── exports/                        # les 4 exports CSV du client (horaire, jour, semaine, mois)
 ├── donnees_externes/               # copie des données Sentinelles utilisées
+├── travaux_equipe/                 # travaux de l'équipe (voir plus bas)
+│   ├── analyse_pharmacie.xlsx
+│   └── Import_donnée.py
 └── requirements.txt
 ```
 
@@ -55,7 +58,7 @@ tourne depuis une copie neuve du dépôt.
 | **Prévision** | Réponse à la question du manager : test sur 12 mois non utilisés, face à la prévision naïve, et prévision du mois suivant. |
 | **Source externe** | Incidence de la grippe (réseau Sentinelles) et ventes hebdomadaires : ce qui relève de l'environnement. |
 | **État des données** | Quel export sert à quoi, contrôles de cohérence, et ce qui a été corrigé ou écarté. |
-| `Pharma_Ventes_*`, `Grippe_Sentinelles` | Les données (exports et grippe) sous forme de tableaux Excel. |
+| Pages de données (masquées) | `Pharma_Ventes_Daily`, `Pharma_Ventes_Hourly` et `Grippe_Sentinelles`, lues par les formules et les graphiques. Pour les afficher : clic droit sur un onglet, puis *Afficher*. Les exports hebdomadaire et mensuel ne servent qu'aux contrôles : ils restent dans `exports/`, sans page dans le classeur. |
 
 Sur Mac : clic droit sur le fichier, puis *Ouvrir avec* > *Microsoft Excel*.
 
@@ -112,6 +115,18 @@ Comment c'est construit :
   `INDEX`/`MATCH`), sans macro, sans nom de tableau ni nom défini ;
 - des valeurs déjà calculées, pour que les chiffres s'affichent dès l'ouverture ;
 - un onglet protégé, sans mot de passe (*Révision > Ôter la protection*).
+
+## Travaux de l'équipe (`travaux_equipe/`)
+
+- **`analyse_pharmacie.xlsx`** : un autre classeur d'analyse, produit par un
+  script `main.py` (pas encore dans le dépôt). Il contient Synthese, Outil,
+  Stats, Prevision (tests de tendance et de saisonnalité, lissages,
+  Holt-Winters, test sur 24 mois), Etat_donnees et Dictionnaire. Ses pages de
+  données (Mensuel, Backtest, Donnees) sont masquées : l'onglet Outil et les
+  graphiques en ont besoin.
+- **`Import_donnée.py`** : diagnostic d'un classeur `données propres.xlsx` à
+  4 feuilles (présence des feuilles, doublons, périodes de dates communes). Le
+  fichier `données propres.xlsx` doit être placé à côté du script.
 
 ## Qui a fait quoi
 
