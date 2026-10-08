@@ -1,48 +1,24 @@
-"""Construit le classeur des ventes avec l'onglet « Tableau de bord » (sans macro).
+"""Onglet « Tableau de bord » : l'outil de sélection du pharmacien, sans macro.
 
-Le script lit les feuilles de données d'un classeur (par défaut Donnees_propres.xlsx),
-puis réécrit un classeur propre qui contient :
-
-- les feuilles de données, recopiées en tableaux Excel ordinaires ;
-- l'onglet Tableau de bord : choix des médicaments, de la période et du
-  regroupement, chiffres clés, graphiques, tableau des achats et résultats
-  détaillés, le tout recalculé par formules dans Excel ;
-- deux onglets de calcul masqués (Calculs, Jours).
-
-Les formules n'utilisent que des références de cellules simples (pas de nom de
-tableau ni de nom défini) : elles fonctionnent dans Excel (Windows, Mac, en
-ligne) comme dans LibreOffice. Les valeurs sont aussi enregistrées déjà
-calculées, pour que les chiffres s'affichent dès l'ouverture.
-
-    python creer_tableau_de_bord.py
-    python creer_tableau_de_bord.py --excel classeur_source.xlsx --sortie Donnees_propres.xlsx
+Le pharmacien choisit les médicaments (Oui / Non), une période et un regroupement ;
+les chiffres clés, les graphiques, le tableau des achats et les résultats détaillés
+se recalculent par formules. Les formules n'utilisent que des références de cellules
+simples (pas de nom de tableau ni de nom défini) et les valeurs d'ouverture sont
+enregistrées déjà calculées (fonction calculer, qui reproduit les formules).
 """
-import argparse
 import math
-import os
-import re
-import tempfile
 from datetime import date, datetime, timedelta
-from pathlib import Path
 
-import xlsxwriter
-from openpyxl import load_workbook
 from xlsxwriter.utility import xl_col_to_name
 
-ICI = Path(__file__).resolve().parent
-EXCEL_PAR_DEFAUT = ICI / "Donnees_propres.xlsx"
+from .donnees import NOMS
+from .mise_en_forme import (F_DATE, F_PCT, F_QTE, GRIS, VERT, VERT_BARRE, VERT_BORD, VERT_FONCE,
+                            VERT_MOYEN, VERT_PALE, VERT_SAISIE)
 
 FEUILLE, CALCULS, JOURS_F = "Tableau de bord", "Calculs", "Jours"
 JOUR, HEURE = "Pharma_Ventes_Daily", "Pharma_Ventes_Hourly"
-GENEREES = {FEUILLE, CALCULS, JOURS_F}
-CODE_ATC = re.compile(r"[A-Z]\d{2}[A-Z]{0,2}")
 MAX_LIGNES = 400
 
-NOMS = {
-    "M01AB": "Diclofénac", "M01AE": "Ibuprofène",
-    "N02BA": "Aspirine", "N02BE": "Paracétamol", "N05B": "Anxiolytiques", "N05C": "Hypnotiques, sédatifs",
-    "R03": "Asthme, BPCO", "R06": "Antihistaminiques",
-}
 REGROUPEMENTS = ["Jour", "Semaine", "Mois", "Année", "Jour de la semaine", "Heure"]
 VALEURS = ["Somme", "Moyenne par jour"]
 JOURS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
@@ -50,45 +26,19 @@ JOURS_COURTS = ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."]
 MOIS = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août",
         "Septembre", "Octobre", "Novembre", "Décembre"]
 
-# Valeurs proposées à l'ouverture : les 12 derniers mois complets, par mois
-DEFAUT = {"debut": date(2018, 10, 1), "fin": date(2019, 9, 30), "regroupement": "Mois", "valeur": "Somme",
-          "jours_couvrir": 30, "marge": 0.2}
+# Valeurs proposées à l'ouverture (la période est fixée sur les 12 derniers mois complets des données)
+DEFAUT = {"regroupement": "Mois", "valeur": "Somme", "jours_couvrir": 30, "marge": 0.2}
 
-# Thème vert
-VERT_FONCE, VERT, VERT_MOYEN = "#1B5E20", "#2E7D32", "#43A047"
-VERT_PALE, VERT_SAISIE, VERT_BORD, GRIS = "#F1F8E9", "#DCEDC8", "#689F38", "#616161"
-VERT_BARRE = "#A5D6A7"  # barres dans les cellules : assez clair pour que le chiffre reste lisible
+
+def periode_par_defaut(dates):
+    """Les 12 derniers mois complets présents dans les données (ou toute la période si moins d'un an)."""
+    dernier = max(dates)
+    fin = dernier if (dernier + timedelta(days=1)).day == 1 else date(dernier.year, dernier.month, 1) - timedelta(days=1)
+    debut = date(fin.year - 1, fin.month, 1) + timedelta(days=32)
+    debut = date(debut.year, debut.month, 1)
+    return max(debut, min(dates)), fin
+
 LARGEUR_B, LARGEUR_C = 30, 12.5
-F_QTE, F_DATE, F_DATE_HEURE, F_PCT = "#,##0.00", "dd/mm/yyyy", "dd/mm/yyyy hh:mm", "0%"
-
-
-# ---------------------------------------------------------------------- Lecture du classeur source
-def lire_classeur(chemin):
-    """Valeurs, largeurs de colonnes et tableaux de chaque feuille de données."""
-    wb = load_workbook(chemin, data_only=True)
-    feuilles = []
-    for ws in wb.worksheets:
-        if ws.title in GENEREES:
-            continue
-        lignes = [list(r) for r in ws.iter_rows(values_only=True)]
-        while lignes and all(v is None for v in lignes[-1]):
-            lignes.pop()
-        tables = [(nom, ws.tables[nom].ref, ws.tables[nom].tableStyleInfo) for nom in ws.tables]
-        largeurs = {k: d.width for k, d in ws.column_dimensions.items() if d.width}
-        feuilles.append({"nom": ws.title, "lignes": lignes, "tables": tables, "largeurs": largeurs})
-    return feuilles
-
-
-def colonnes(feuille, noms_requis):
-    entete = feuille["lignes"][0]
-    manquants = [n for n in noms_requis if n not in entete]
-    if manquants:
-        raise SystemExit(f"Colonnes {manquants} introuvables dans {feuille['nom']}")
-    return {n: entete.index(n) for n in entete if n is not None}
-
-
-def nombre(v):
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
 
 
 def serie(d):
@@ -97,9 +47,6 @@ def serie(d):
         return (d - datetime(1899, 12, 30)).total_seconds() / 86400
     return (d - date(1899, 12, 30)).days
 
-
-def jour_seul(v):
-    return v.date() if isinstance(v, datetime) else v
 
 
 # ---------------------------------------------------------------------- Calcul des valeurs affichées
@@ -203,24 +150,18 @@ def calculer(jours, heures, codes, entrees):
 
 
 # ---------------------------------------------------------------------- Écriture
-def construire(source, sortie):
-    feuilles = lire_classeur(source)
-    par_nom = {f["nom"]: f for f in feuilles}
-    if JOUR not in par_nom or HEURE not in par_nom:
-        raise SystemExit(f"Feuilles {JOUR} et {HEURE} introuvables dans {source}")
-    entete_j = par_nom[JOUR]["lignes"][0]
-    codes = [c for c in entete_j if isinstance(c, str) and CODE_ATC.fullmatch(c)]
-    cj = colonnes(par_nom[JOUR], ["datum", *codes])
-    ch = colonnes(par_nom[HEURE], ["datum", "Hour", *codes])
+def ajouter_tableau_de_bord(wb, fmt, ws, jours, heures, codes, cj, ch, nd, nh):
+    """Remplit la feuille ws (déjà créée) et ajoute les onglets masqués Calculs et Jours.
 
-    jours = [(jour_seul(r[cj["datum"]]), {c: nombre(r[cj[c]]) for c in codes})
-             for r in par_nom[JOUR]["lignes"][1:] if r[cj["datum"]] is not None]
-    heures = [(r[ch["datum"]], int(r[ch["Hour"]]), {c: nombre(r[ch[c]]) for c in codes})
-              for r in par_nom[HEURE]["lignes"][1:] if r[ch["datum"]] is not None]
-    nd, nh = len(par_nom[JOUR]["lignes"]), len(par_nom[HEURE]["lignes"])  # dernière ligne Excel
+    jours : [(date, {code: quantité})] dans l'ordre de la feuille journalière ;
+    heures : [(datetime, heure, {code: quantité})] ; cj / ch : n° de colonne (0 = A) de
+    datum, Hour et de chaque code dans les feuilles journalière et horaire ;
+    nd / nh : dernière ligne Excel de ces feuilles.
+    """
     n = len(codes)
-
-    entrees = dict(DEFAUT, inclus={c: True for c in codes})
+    debut, fin = periode_par_defaut([d for d, _ in jours])
+    DEF = dict(DEFAUT, debut=debut, fin=fin)
+    entrees = dict(DEF, inclus={c: True for c in codes})
     v = calculer(jours, heures, codes, entrees)
 
     # Plages des données (références simples, valables dans tous les tableurs)
@@ -233,58 +174,6 @@ def construire(source, sortie):
     H = {c: plage(HEURE, ch[c], nh) for c in codes}
     J = {col: f"{JOURS_F}!${col}$2:${col}${len(jours) + 1}" for col in "ABCDEF"}
     TDB = f"'{FEUILLE}'"
-
-    dossier = Path(sortie).resolve().parent
-    tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", dir=dossier, delete=False)
-    tmp.close()
-    wb = xlsxwriter.Workbook(tmp.name)
-    fm = {}
-
-    def fmt(**proprietes):
-        cle = tuple(sorted(proprietes.items()))
-        if cle not in fm:
-            fm[cle] = wb.add_format(dict(proprietes, font_name="Calibri", font_size=proprietes.get("font_size", 11)))
-        return fm[cle]
-
-    ws = wb.add_worksheet(FEUILLE)
-
-    # ---------------- feuilles de données recopiées telles quelles
-    for f in feuilles:
-        wd = wb.add_worksheet(f["nom"])
-        lignes = f["lignes"]
-        avec_heure = {}
-        for c in range(len(lignes[0])):
-            vals = [r[c] for r in lignes[1:] if c < len(r) and isinstance(r[c], datetime)]
-            avec_heure[c] = any(x.hour or x.minute for x in vals)
-        for r, ligne in enumerate(lignes):
-            for c, val in enumerate(ligne):
-                if val is None:
-                    continue
-                if isinstance(val, datetime):
-                    wd.write_datetime(r, c, val, fmt(num_format=F_DATE_HEURE if avec_heure[c] else F_DATE))
-                elif isinstance(val, date):
-                    wd.write_number(r, c, serie(val), fmt(num_format=F_DATE))
-                elif isinstance(val, bool):
-                    wd.write_boolean(r, c, val)
-                elif isinstance(val, (int, float)):
-                    wd.write_number(r, c, val)
-                else:
-                    wd.write_string(r, c, str(val))
-        for nom_t, ref, _style in f["tables"]:
-            premiere, derniere = ref.split(":")
-            debut_c = re.match(r"([A-Z]+)(\d+)", premiere)
-            fin_c = re.match(r"([A-Z]+)(\d+)", derniere)
-            r0, r1 = int(debut_c[2]) - 1, int(fin_c[2]) - 1
-            c0 = sum((ord(ch_) - 64) * 26 ** k for k, ch_ in enumerate(reversed(debut_c[1]))) - 1
-            c1 = sum((ord(ch_) - 64) * 26 ** k for k, ch_ in enumerate(reversed(fin_c[1]))) - 1
-            entetes = [str(lignes[r0][c]) for c in range(c0, c1 + 1)]
-            wd.add_table(r0, c0, r1, c1, {"name": nom_t, "style": "Table Style Medium 7",
-                                          "columns": [{"header": h} for h in entetes]})
-        for c in range(len(lignes[0])):
-            lettre = xl_col_to_name(c)
-            largeur = f["largeurs"].get(lettre) or (17 if avec_heure.get(c) else 12)
-            wd.set_column(c, c, largeur)
-        wd.freeze_panes(1, 0)
 
     calc = wb.add_worksheet(CALCULS)
     wj = wb.add_worksheet(JOURS_F)
@@ -341,8 +230,8 @@ def construire(source, sortie):
     reg = f"{TDB}!$C${L_REG}"
     num_reg = "".join(f'IF({reg}="{r}",{i},' for i, r in enumerate(REGROUPEMENTS, 1)) + "3" + ")" * 6
     parametres = [
-        ("Début", f"={TDB}!{C_DEB}", serie(DEFAUT["debut"]), F_DATE),
-        ("Fin", f"={TDB}!{C_FIN}", serie(DEFAUT["fin"]), F_DATE),
+        ("Début", f"={TDB}!{C_DEB}", serie(DEF["debut"]), F_DATE),
+        ("Fin", f"={TDB}!{C_FIN}", serie(DEF["fin"]), F_DATE),
         ("N° de regroupement", "=" + num_reg, v["g"], None),
         ("Lundi de la 1re semaine", f"={P['debut']}-WEEKDAY({P['debut']},2)+1",
          serie(v["lundi"]), F_DATE),
@@ -489,10 +378,10 @@ def construire(source, sortie):
     ws.write(f"B{L_REG}", "Regrouper par")
     ws.write(f"B{L_VAL}", "Valeur")
     date_saisie = fmt(num_format=F_DATE, **saisie)
-    ws.write_number(f"C{L_DU}", serie(DEFAUT["debut"]), date_saisie)
-    ws.write_number(f"C{L_AU}", serie(DEFAUT["fin"]), date_saisie)
-    ws.merge_range(f"C{L_REG}:D{L_REG}", DEFAUT["regroupement"], fmt(**saisie))
-    ws.merge_range(f"C{L_VAL}:D{L_VAL}", DEFAUT["valeur"], fmt(**saisie))
+    ws.write_number(f"C{L_DU}", serie(DEF["debut"]), date_saisie)
+    ws.write_number(f"C{L_AU}", serie(DEF["fin"]), date_saisie)
+    ws.merge_range(f"C{L_REG}:D{L_REG}", DEF["regroupement"], fmt(**saisie))
+    ws.merge_range(f"C{L_VAL}:D{L_VAL}", DEF["valeur"], fmt(**saisie))
     ws.write(f"B{L_DISPO}", "Données disponibles", petit)
     ws.write_formula(f"C{L_DISPO}", f"=MIN({D_DATE})", fmt(font_size=9, font_color=GRIS, num_format=F_DATE),
                      serie(min(d for d, _ in jours)))
@@ -528,7 +417,7 @@ def construire(source, sortie):
          f"avec {v['max_jour']:,.0f} ventes".replace(",", " ")),
         ("K", 12, "Jours de données", f"={CP['nb_jours']}", "0", v["nb_jours"],
          f'="du "&{chaine_date(C_DEB)}&" au "&{chaine_date(C_FIN)}',
-         f"du {DEFAUT['debut']:%d/%m/%Y} au {DEFAUT['fin']:%d/%m/%Y}"),
+         f"du {DEF['debut']:%d/%m/%Y} au {DEF['fin']:%d/%m/%Y}"),
     ]
     for col, r, libelle, formule, nf, valeur, sous_formule, sous_valeur in tuiles:
         c0 = ord(col) - 65
@@ -595,10 +484,10 @@ def construire(source, sortie):
     ws.merge_range(f"B{L_ACH}:M{L_ACH}", "⑤ Tableau des achats", entete_f)
     L_JC, L_MARGE, L_NOTE, L_ACH_T = L_ACH + 1, L_ACH + 2, L_ACH + 3, L_ACH + 4
     ws.write(f"B{L_JC}", "Jours à couvrir")
-    ws.write_number(f"C{L_JC}", DEFAUT["jours_couvrir"], fmt(num_format="0", **saisie))
+    ws.write_number(f"C{L_JC}", DEF["jours_couvrir"], fmt(num_format="0", **saisie))
     ws.write(f"D{L_JC}", "jours", petit)
     ws.write(f"B{L_MARGE}", "Marge de sécurité")
-    ws.write_number(f"C{L_MARGE}", DEFAUT["marge"], fmt(num_format="0%", **saisie))
+    ws.write_number(f"C{L_MARGE}", DEF["marge"], fmt(num_format="0%", **saisie))
     ws.data_validation(f"C{L_JC}", {"validate": "integer", "criteria": "between", "minimum": 1, "maximum": 365,
                                     "error_title": "Valeur non valide", "error_message": "Entre 1 et 365 jours."})
     ws.data_validation(f"C{L_MARGE}", {"validate": "decimal", "criteria": "between", "minimum": 0, "maximum": 2,
@@ -607,7 +496,7 @@ def construire(source, sortie):
             f'&" × jours à couvrir × (1 + marge) − stock actuel, arrondi à l\'unité supérieure."')
     ws.merge_range(f"B{L_NOTE}:M{L_NOTE}", "", petit)
     ws.write_formula(f"B{L_NOTE}", note, petit,
-                     f"Calcul : moyenne par jour du {DEFAUT['debut']:%d/%m/%Y} au {DEFAUT['fin']:%d/%m/%Y} × jours "
+                     f"Calcul : moyenne par jour du {DEF['debut']:%d/%m/%Y} au {DEF['fin']:%d/%m/%Y} × jours "
                      f"à couvrir × (1 + marge) − stock actuel, arrondi à l'unité supérieure.")
     titres_achats = ["Médicament", "Moyenne / jour", None, "Marge de sécurité", "Stock actuel", "À commander",
                      "Jour le plus fort", "Mois le plus fort"]
@@ -616,14 +505,14 @@ def construire(source, sortie):
         cellule = f"{chr(66 + k)}{L_ACH_T}"
         if titre is None:
             ws.write_formula(cellule, f'="Besoin sur "&$C${L_JC}&" jours"', col_f_d,
-                             f"Besoin sur {DEFAUT['jours_couvrir']} jours")
+                             f"Besoin sur {DEF['jours_couvrir']} jours")
         else:
             ws.write(cellule, titre, col_f if k == 0 else col_f_d)
     for i, code in enumerate(codes):
         r = L_ACH_T + 1 + i
         m = v["meds"][code]
-        besoin = m["moy"] * DEFAUT["jours_couvrir"]
-        marge = besoin * DEFAUT["marge"]
+        besoin = m["moy"] * DEF["jours_couvrir"]
+        marge = besoin * DEF["marge"]
         ws.write(f"B{r}", f"{code} · {NOMS.get(code, code)}")
         ws.write_formula(f"C{r}", f"={CALCULS}!$D${L_CMED + i}", qte, m["moy"])
         ws.write_formula(f"D{r}", f"=C{r}*$C${L_JC}", qte, besoin)
@@ -648,7 +537,7 @@ def construire(source, sortie):
     titre_res = f'="⑥ Résultats par "&LOWER($C${L_REG})&IF({CP["par_jour"]}=1," (moyenne par jour)"," (somme)")'
     ws.merge_range(f"B{L_RES}:L{L_RES}", "", entete_f)
     ws.write_formula(f"B{L_RES}", titre_res, entete_f,
-                     f"⑥ Résultats par {DEFAUT['regroupement'].lower()} "
+                     f"⑥ Résultats par {DEF['regroupement'].lower()} "
                      f"({'moyenne par jour' if v['par_jour'] else 'somme'})")
     ws.set_row(L_RES, 30)
     for k, titre in enumerate(["Période", *codes, "Total sélection", "Nb jours"]):
@@ -689,20 +578,4 @@ def construire(source, sortie):
     ws.set_paper(9)
     ws.fit_to_pages(1, 0)
     ws.protect("", {"select_locked_cells": True, "select_unlocked_cells": True})
-    ws.activate()
-    wb.close()
-    os.replace(tmp.name, sortie)
-    print(f"Classeur écrit : {sortie} ({n} médicaments, {len(jours)} jours, {len(heures)} heures)")
     return v
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Construit le classeur des ventes avec son tableau de bord.")
-    parser.add_argument("--excel", type=Path, default=EXCEL_PAR_DEFAUT, help="classeur source (feuilles de données)")
-    parser.add_argument("--sortie", type=Path, help="classeur à écrire (défaut : remplace --excel)")
-    args = parser.parse_args()
-    construire(args.excel, args.sortie or args.excel)
-
-
-if __name__ == "__main__":
-    main()

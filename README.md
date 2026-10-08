@@ -1,60 +1,28 @@
 # Rush 2 : ventes de la pharmacie
 
-Un classeur Excel propre (`Donnees_propres.xlsx`) avec un **tableau de bord
-qui fonctionne entièrement dans Excel**, et deux scripts Python : l'un fabrique
-le tableau de bord, l'autre va chercher les informations dans l'Excel au moment
-où on les demande.
+Analyse des ventes de huit groupes de médicaments d'une pharmacie indépendante,
+de janvier 2014 à octobre 2019. Le dépôt contient :
+- les quatre exports du client ;
+- le code Python qui produit tout le classeur à partir de ces exports ;
+- le classeur lui-même (`Donnees_propres.xlsx`), avec l'outil de sélection du pharmacien.
 
 ```
 TEST-PHARMA/
-├── Donnees_propres.xlsx       # données propres + onglet « Tableau de bord »
-├── creer_tableau_de_bord.py   # (re)construit le classeur et son tableau de bord
-├── interroger_excel.py        # interroge le classeur en live (fichier local ou dépôt git)
-├── exports/                   # les 4 exports CSV bruts du client
+├── Donnees_propres.xlsx            # le classeur livré au client (généré par le code)
+├── creer_classeur.py               # point d'entrée : exports → classeur complet
+├── analyse/
+│   ├── donnees.py                  # lecture des exports, nettoyage, contrôles de cohérence
+│   ├── statistiques.py             # statistiques descriptives
+│   ├── prevision.py                # test de prévision du mois suivant
+│   ├── externe.py                  # source publique : grippe (réseau Sentinelles)
+│   ├── tableau_de_bord.py          # outil de sélection (formules Excel, sans macro)
+│   ├── feuilles.py                 # écriture des onglets d'analyse
+│   └── mise_en_forme.py            # thème vert et mise en page communs
+├── interroger_excel.py             # interroge le classeur en live (fichier local ou dépôt git)
+├── exports/                        # les 4 exports CSV du client (horaire, jour, semaine, mois)
+├── donnees_externes/               # copie des données Sentinelles utilisées
 └── requirements.txt
 ```
-
-## Le tableau de bord (dans Excel, sans macro)
-
-Ouvrez `Donnees_propres.xlsx` (sur Mac : clic droit > *Ouvrir avec* >
-*Microsoft Excel*). Le classeur s'ouvre sur l'onglet **Tableau de bord**, qui
-se lit de haut en bas. Seules les **cellules vert clair** se modifient.
-
-| Bloc | Contenu |
-|------|---------|
-| ① Médicaments | `Oui` / `Non` devant chacun des 8 groupes ATC, total de la période et part de chacun |
-| ② Période et affichage | dates Du / Au, regroupement (`Jour`, `Semaine`, `Mois`, `Année`, `Jour de la semaine`, `Heure`), `Somme` ou `Moyenne par jour` |
-| ③ Chiffres clés | quantité vendue, moyenne par jour, meilleur jour, nombre de jours |
-| ④ Graphiques | évolution de la sélection, ventes moyennes par jour de la semaine et par heure |
-| ⑤ Tableau des achats | quantité à commander par médicament (voir ci-dessous), jour et mois les plus forts |
-| ⑥ Résultats détaillés | une ligne par jour, semaine, mois… (jusqu'à 400 lignes), une colonne par médicament, total et nombre de jours |
-
-**Tableau des achats.** On indique le nombre de jours à couvrir, une marge de
-sécurité et le stock actuel de chaque médicament. Pour chaque médicament :
-
-    à commander = moyenne par jour sur la période choisie × jours à couvrir × (1 + marge) − stock actuel
-
-Le résultat est arrondi à l'unité supérieure, et jamais négatif. Le jour de la
-semaine et le mois les plus forts sont calculés sur tout l'historique : ils
-indiquent quand prévoir plus de stock.
-
-Un message rouge prévient en cas de problème : date de fin avant la date de
-début, aucun médicament inclus, ou plus de 400 lignes (choisir alors un
-regroupement plus large).
-
-Comment c'est construit :
-
-- **des formules Excel simples** (`SUMIF`, `SUMIFS`, `COUNTIFS`, `AVERAGEIF`,
-  `INDEX`/`MATCH`), sans macro, sans nom de tableau ni nom défini. Le classeur
-  marche dans Excel sur Windows, sur Mac et en ligne, comme dans LibreOffice ;
-- **des valeurs déjà calculées** : les chiffres s'affichent dès l'ouverture,
-  même avant le recalcul d'Excel ;
-- **chaque graphique est ancré dans sa propre zone de cellules**, pour
-  qu'aucun bloc ne se chevauche, quel que soit l'écran ;
-- **l'onglet est protégé, sans mot de passe**, pour éviter d'écraser une
-  formule par erreur. Pour le modifier : *Révision > Ôter la protection de la feuille* ;
-- **des onglets de calcul masqués** : `Calculs` pour les paramètres, les
-  périodes et les profils, `Jours` pour une ligne de calcul par jour de données.
 
 ## Installation
 
@@ -64,41 +32,94 @@ cd TEST-PHARMA
 pip install -r requirements.txt
 ```
 
-## Recréer le classeur et son tableau de bord
+## Régénérer le classeur
 
 ```bash
-python creer_tableau_de_bord.py
-python creer_tableau_de_bord.py --excel classeur_source.xlsx --sortie Donnees_propres.xlsx
+python creer_classeur.py                  # exports/ → Donnees_propres.xlsx
+python creer_classeur.py --maj-externe    # retélécharge aussi les données Sentinelles
 ```
 
-Le script lit les feuilles de données du classeur source (par défaut
-`Donnees_propres.xlsx`) et réécrit un classeur propre : les données recopiées
-en tableaux Excel ordinaires, le tableau de bord et les onglets de calcul. Les
-données sont recopiées sous forme de valeurs. Les requêtes Power Query d'un
-classeur source ne sont pas reprises, car elles pointent vers des fichiers qui
-n'existent pas chez le client. Relancez-le après chaque mise à jour des
-données. Les formules sont dimensionnées sur le nombre de lignes présentes.
+Chaque mois, le client envoie les quatre fichiers avec tout l'historique. Il
+suffit de remplacer ceux du dossier `exports/` et de relancer la commande. Les
+contrôles, les statistiques, le test de prévision, l'analyse de la grippe et
+l'outil de sélection sont recalculés, sans rien refaire à la main. Le code
+tourne depuis une copie neuve du dépôt.
 
-## Structure de l'Excel lue par le script
+## Les onglets du classeur
 
-| Feuille                 | Utilisée pour |
-|-------------------------|---------------|
-| `Pharma_Ventes_Daily`   | total, jour, semaine, mois, année, jour de la semaine |
-| `Pharma_Ventes_Hourly`  | profils heure par heure |
-| `Pharma_Ventes_Weekly`, `Pharma_Ventes_Monthly` | non lues par le script (voir plus bas) |
+| Onglet | Contenu |
+|--------|---------|
+| **Synthèse** | Chiffres clés, ce qu'il faut retenir, recommandations pour le pharmacien achats, le propriétaire et le manager. Le texte est généré à partir des chiffres calculés. |
+| **Tableau de bord** | L'outil de sélection : médicaments `Oui`/`Non`, une période, un regroupement. Chiffres clés, graphiques, tableau des achats et résultats détaillés. Formules Excel, sans macro. |
+| **Statistiques** | Poids de chaque groupe, irrégularité, tendance par année, saisonnalité mensuelle, jours de la semaine, tranches horaires, corrélations. |
+| **Prévision** | Réponse à la question du manager : test sur 12 mois non utilisés, face à la prévision naïve, et prévision du mois suivant. |
+| **Source externe** | Incidence de la grippe (réseau Sentinelles) et ventes hebdomadaires : ce qui relève de l'environnement. |
+| **État des données** | Quel export sert à quoi, contrôles de cohérence, et ce qui a été corrigé ou écarté. |
+| `Pharma_Ventes_*`, `Grippe_Sentinelles` | Les données (exports et grippe) sous forme de tableaux Excel. |
 
-Dans chaque feuille, le script lit la colonne `datum` et toutes les colonnes
-dont le nom est un code ATC (`M01AB`, `N05B`, `R03`…). Un nouveau code ATC
-ajouté en colonne est donc pris en compte automatiquement. Si une feuille ou la
-colonne de date est renommée, il suffit de changer les constantes en haut du
-script (`FEUILLE_JOUR`, `FEUILLE_HEURE`, `COLONNE_DATE`).
+Sur Mac : clic droit sur le fichier, puis *Ouvrir avec* > *Microsoft Excel*.
 
-Les semaines, les mois et les années sont recalculés à partir de la feuille
-journalière. Cela donne des résultats cohérents entre eux, et cela marche pour
-n'importe quelle période (par exemple du 15 mars au 10 avril). Les feuilles
-hebdomadaire et mensuelle ne concordent pas exactement avec le journalier.
-L'export mensuel brut diverge déjà sur 31 mois, et les arrondis ont été faits
-séparément dans chaque feuille.
+### Choix sur les données (détail dans l'onglet État des données)
+
+- **L'export journalier sert de référence.** Il concorde exactement avec
+  l'horaire et l'hebdomadaire.
+- **L'export mensuel est écarté**, car il diverge sur 31 mois. Les ventes
+  mensuelles sont recalculées à partir du journalier.
+- **Jours et mois incomplets.** Les statistiques par jour portent sur les jours
+  complets (24 heures présentes). La prévision porte sur les mois complets
+  (février 2014 → septembre 2019).
+- **Les quantités sont gardées telles qu'enregistrées**, décimales comprises.
+  Un premier import Power Query arrondissait cinq groupes à l'entier, parce
+  qu'il avait déduit le type « nombre entier » des premières lignes.
+
+### Prévision du mois suivant
+
+1. Six méthodes simples sont comparées : prévision naïve, même mois l'an dernier,
+   moyennes mobiles, saisonnalité × niveau, régression tendance + mois.
+2. Chaque méthode ne voit que les mois qui précèdent le mois prévu.
+3. La méthode de chaque groupe est choisie sur 12 mois de validation, puis
+   jugée sur les 12 mois suivants, qu'elle n'a jamais vus.
+4. Verdict « Oui » si elle fait au moins 15 % d'erreur en moins que la
+   prévision naïve, c'est-à-dire refaire les ventes du mois précédent.
+
+### Source externe
+
+Les données viennent du [réseau Sentinelles](https://www.sentiweb.fr) (Inserm) :
+l'incidence hebdomadaire des syndromes grippaux en France, sous forme de
+données ouvertes. Le fichier utilisé est copié dans `donnees_externes/`.
+
+Les ventes des semaines d'épidémie (au moins 150 cas pour 100 000 habitants)
+sont comparées à celles des autres semaines, sur toute l'année et à saison
+égale (novembre à mars). La comparaison à saison égale sépare l'effet de la
+grippe de celui de l'hiver.
+
+### L'outil de sélection (onglet Tableau de bord)
+
+Seules les cellules vert clair se modifient :
+1. `Oui`/`Non` devant chaque médicament ;
+2. les dates Du / Au ;
+3. le regroupement (jour, semaine, mois, année, jour de la semaine, heure) ;
+4. somme ou moyenne par jour.
+
+Les chiffres clés, les graphiques et les résultats détaillés se recalculent
+aussitôt. Le **tableau des achats** propose une quantité à commander par
+médicament :
+
+    à commander = moyenne par jour × jours à couvrir × (1 + marge) − stock actuel
+
+Comment c'est construit :
+- des formules Excel simples (`SUMIF`, `SUMIFS`, `COUNTIFS`, `AVERAGEIF`,
+  `INDEX`/`MATCH`), sans macro, sans nom de tableau ni nom défini ;
+- des valeurs déjà calculées, pour que les chiffres s'affichent dès l'ouverture ;
+- un onglet protégé, sans mot de passe (*Révision > Ôter la protection*).
+
+## Qui a fait quoi
+
+| Membre | Responsabilités |
+|--------|-----------------|
+| *à compléter* | |
+| *à compléter* | |
+| *à compléter* | |
 
 ## Interroger l'Excel
 
