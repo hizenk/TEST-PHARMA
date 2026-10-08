@@ -8,7 +8,7 @@ où on les demande.
 ```
 TEST-PHARMA/
 ├── Donnees_propres.xlsx       # données propres + onglet « Tableau de bord »
-├── creer_tableau_de_bord.py   # (re)crée l'onglet Tableau de bord dans le classeur
+├── creer_tableau_de_bord.py   # (re)construit le classeur et son tableau de bord
 ├── interroger_excel.py        # interroge le classeur en live (fichier local ou dépôt git)
 ├── exports/                   # les 4 exports CSV bruts du client
 └── requirements.txt
@@ -16,24 +16,27 @@ TEST-PHARMA/
 
 ## Le tableau de bord (dans Excel, sans macro)
 
-Ouvrez `Donnees_propres.xlsx` : le classeur s'ouvre sur l'onglet
-**Tableau de bord**. Seules les cellules jaunes se modifient :
+Ouvrez `Donnees_propres.xlsx` (sur Mac : clic droit > *Ouvrir avec* >
+*Microsoft Excel*). Le classeur s'ouvre sur l'onglet **Tableau de bord**, qui
+se lit de haut en bas. Seules les **cellules vert clair** se modifient.
 
-1. **Médicaments** : `Oui` ou `Non` devant chacun des 8 groupes ATC (liste déroulante).
-2. **Période** : date de début et date de fin (limitées aux données disponibles).
-3. **Affichage** : regrouper par `Jour`, `Semaine`, `Mois`, `Année`,
-   `Jour de la semaine` ou `Heure`, et afficher la `Somme` ou la `Moyenne par jour`.
+| Bloc | Contenu |
+|------|---------|
+| ① Médicaments | `Oui` / `Non` devant chacun des 8 groupes ATC, total de la période et part de chacun |
+| ② Période et affichage | dates Du / Au, regroupement (`Jour`, `Semaine`, `Mois`, `Année`, `Jour de la semaine`, `Heure`), `Somme` ou `Moyenne par jour` |
+| ③ Chiffres clés | quantité vendue, moyenne par jour, meilleur jour, nombre de jours |
+| ④ Graphiques | évolution de la sélection, ventes moyennes par jour de la semaine et par heure |
+| ⑤ Tableau des achats | quantité à commander par médicament (voir ci-dessous), jour et mois les plus forts |
+| ⑥ Résultats détaillés | une ligne par jour, semaine, mois… (jusqu'à 400 lignes), une colonne par médicament, total et nombre de jours |
 
-Tout se recalcule immédiatement :
+**Tableau des achats.** On indique le nombre de jours à couvrir, une marge de
+sécurité et le stock actuel de chaque médicament. Pour chaque médicament :
 
-- **4 indicateurs** : quantité vendue, moyenne par jour, meilleur jour (et sa
-  quantité), nombre de jours de données ;
-- **le détail par médicament** : total, moyenne par jour, part de la sélection ;
-- **le tableau des résultats** (jusqu'à 400 lignes) avec une colonne par
-  médicament, le total de la sélection en barres et le nombre de jours de
-  chaque ligne (une période incomplète se voit tout de suite) ;
-- **4 graphiques** : évolution de la sélection, profil selon le jour de la
-  semaine, profil heure par heure, total par médicament.
+    à commander = moyenne par jour sur la période choisie × jours à couvrir × (1 + marge) − stock actuel
+
+Le résultat est arrondi à l'unité supérieure, et jamais négatif. Le jour de la
+semaine et le mois les plus forts sont calculés sur tout l'historique : ils
+indiquent quand prévoir plus de stock.
 
 Un message rouge prévient en cas de problème : date de fin avant la date de
 début, aucun médicament inclus, ou plus de 400 lignes (choisir alors un
@@ -41,15 +44,17 @@ regroupement plus large).
 
 Comment c'est construit :
 
-- uniquement des formules Excel classiques (`SUMIFS`, `COUNTIFS`,
-  `SUMPRODUCT`, `INDEX`/`MATCH`), sans macro ni fonction récente : cela marche
-  dans Excel 365 comme dans les versions plus anciennes ;
-- les formules lisent directement les tableaux `Pharma_Ventes_Daily` et
-  `Pharma_Ventes_Hourly`. Si on ajoute des lignes à ces tableaux, le tableau de
-  bord les prend en compte sans rien recopier ;
-- l'onglet est protégé, sans mot de passe, pour éviter d'écraser une formule
-  par erreur. Pour le modifier : *Révision > Ôter la protection de la feuille* ;
-- les calculs intermédiaires sont dans l'onglet masqué `Calculs`.
+- **des formules Excel simples** (`SUMIF`, `SUMIFS`, `COUNTIFS`, `AVERAGEIF`,
+  `INDEX`/`MATCH`), sans macro, sans nom de tableau ni nom défini. Le classeur
+  marche dans Excel sur Windows, sur Mac et en ligne, comme dans LibreOffice ;
+- **des valeurs déjà calculées** : les chiffres s'affichent dès l'ouverture,
+  même avant le recalcul d'Excel ;
+- **chaque graphique est ancré dans sa propre zone de cellules**, pour
+  qu'aucun bloc ne se chevauche, quel que soit l'écran ;
+- **l'onglet est protégé, sans mot de passe**, pour éviter d'écraser une
+  formule par erreur. Pour le modifier : *Révision > Ôter la protection de la feuille* ;
+- **des onglets de calcul masqués** : `Calculs` pour les paramètres, les
+  périodes et les profils, `Jours` pour une ligne de calcul par jour de données.
 
 ## Installation
 
@@ -59,17 +64,20 @@ cd TEST-PHARMA
 pip install -r requirements.txt
 ```
 
-## Recréer le tableau de bord
+## Recréer le classeur et son tableau de bord
 
 ```bash
 python creer_tableau_de_bord.py
+python creer_tableau_de_bord.py --excel classeur_source.xlsx --sortie Donnees_propres.xlsx
 ```
 
-Le script remplace l'onglet Tableau de bord (et l'onglet `Calculs`) dans
-`Donnees_propres.xlsx`. Il ne touche pas aux feuilles de données. Il faut le
-relancer si les données changent de structure, par exemple avec un nouveau code
-ATC ou une colonne renommée. Avec `--excel` et `--sortie`, il peut travailler
-sur un autre classeur.
+Le script lit les feuilles de données du classeur source (par défaut
+`Donnees_propres.xlsx`) et réécrit un classeur propre : les données recopiées
+en tableaux Excel ordinaires, le tableau de bord et les onglets de calcul. Les
+données sont recopiées sous forme de valeurs. Les requêtes Power Query d'un
+classeur source ne sont pas reprises, car elles pointent vers des fichiers qui
+n'existent pas chez le client. Relancez-le après chaque mise à jour des
+données. Les formules sont dimensionnées sur le nombre de lignes présentes.
 
 ## Structure de l'Excel lue par le script
 

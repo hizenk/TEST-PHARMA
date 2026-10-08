@@ -1,520 +1,704 @@
-"""Ajoute l'onglet « Tableau de bord » dans Donnees_propres.xlsx.
+"""Construit le classeur des ventes avec l'onglet « Tableau de bord » (sans macro).
 
-Le tableau de bord fonctionne entièrement dans Excel, sans macro : on choisit
-les médicaments (Oui / Non), une période et un regroupement, et les chiffres,
-le tableau et les graphiques se recalculent tout seuls par formules à partir
-des feuilles Pharma_Ventes_Daily et Pharma_Ventes_Hourly.
+Le script lit les feuilles de données d'un classeur (par défaut Donnees_propres.xlsx),
+puis réécrit un classeur propre qui contient :
 
-À relancer après chaque mise à jour des données (le script remplace l'ancien
-tableau de bord et ne touche pas aux feuilles de données) :
+- les feuilles de données, recopiées en tableaux Excel ordinaires ;
+- l'onglet Tableau de bord : choix des médicaments, de la période et du
+  regroupement, chiffres clés, graphiques, tableau des achats et résultats
+  détaillés, le tout recalculé par formules dans Excel ;
+- deux onglets de calcul masqués (Calculs, Jours).
+
+Les formules n'utilisent que des références de cellules simples (pas de nom de
+tableau ni de nom défini) : elles fonctionnent dans Excel (Windows, Mac, en
+ligne) comme dans LibreOffice. Les valeurs sont aussi enregistrées déjà
+calculées, pour que les chiffres s'affichent dès l'ouverture.
 
     python creer_tableau_de_bord.py
-    python creer_tableau_de_bord.py --excel autre_classeur.xlsx --sortie copie.xlsx
+    python creer_tableau_de_bord.py --excel classeur_source.xlsx --sortie Donnees_propres.xlsx
 """
 import argparse
+import math
+import os
 import re
-from datetime import datetime
+import tempfile
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import xlsxwriter
 from openpyxl import load_workbook
-from openpyxl.chart import BarChart, Reference, ScatterChart, Series
-from openpyxl.chart.label import DataLabelList
-from openpyxl.chart.marker import DataPoint, Marker
-from openpyxl.chart.shapes import GraphicalProperties
-from openpyxl.chart.text import RichText, Text
-from openpyxl.chart.title import Title
-from openpyxl.drawing.text import CharacterProperties, Paragraph, ParagraphProperties, RegularTextRun
-from openpyxl.formatting.rule import DataBarRule, FormulaRule
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
-from openpyxl.utils import get_column_letter
-from openpyxl.workbook.defined_name import DefinedName
-from openpyxl.worksheet.datavalidation import DataValidation
+from xlsxwriter.utility import xl_col_to_name
 
 ICI = Path(__file__).resolve().parent
 EXCEL_PAR_DEFAUT = ICI / "Donnees_propres.xlsx"
 
-FEUILLE = "Tableau de bord"
-CALCULS = "Calculs"
-JOUR = "Pharma_Ventes_Daily"  # nom de la feuille ET du tableau Excel des ventes journalières
-HEURE = "Pharma_Ventes_Hourly"
+FEUILLE, CALCULS, JOURS_F = "Tableau de bord", "Calculs", "Jours"
+JOUR, HEURE = "Pharma_Ventes_Daily", "Pharma_Ventes_Hourly"
+GENEREES = {FEUILLE, CALCULS, JOURS_F}
 CODE_ATC = re.compile(r"[A-Z]\d{2}[A-Z]{0,2}")
-MAX_LIGNES = 400  # lignes du tableau de résultats
+MAX_LIGNES = 400
 
 NOMS = {
-    "M01AB": "Diclofénac (anti-inflammatoire)", "M01AE": "Ibuprofène (anti-inflammatoire)",
+    "M01AB": "Diclofénac", "M01AE": "Ibuprofène",
     "N02BA": "Aspirine", "N02BE": "Paracétamol", "N05B": "Anxiolytiques", "N05C": "Hypnotiques, sédatifs",
     "R03": "Asthme, BPCO", "R06": "Antihistaminiques",
 }
-# Une couleur fixe par médicament (palette validée pour le daltonisme), dans le même ordre partout.
-PALETTE = ["2A78D6", "EB6834", "1BAF7A", "EDA100", "E87BA4", "008300", "4A3AA7", "E34948"]
 REGROUPEMENTS = ["Jour", "Semaine", "Mois", "Année", "Jour de la semaine", "Heure"]
 VALEURS = ["Somme", "Moyenne par jour"]
 JOURS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
+JOURS_COURTS = ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."]
 MOIS = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août",
         "Septembre", "Octobre", "Novembre", "Décembre"]
 
-# Mise en page
-BLEU_FONCE, BLEU, GRIS_TEXTE, GRIS_CLAIR = "1F3864", "2A78D6", "595959", "A6A6A6"
-FOND_SAISIE, FOND_TUILE, FOND_ENTETE = "FFF2CC", "F3F6FA", "1F4E78"
-FMT_QTE, FMT_DATE, FMT_PCT = "#,##0.00", "dd/mm/yyyy", "0%"
-TRAIT = Side(style="thin", color="BFBFBF")
-CADRE = Border(left=TRAIT, right=TRAIT, top=TRAIT, bottom=TRAIT)
+# Valeurs proposées à l'ouverture : les 12 derniers mois complets, par mois
+DEFAUT = {"debut": date(2018, 10, 1), "fin": date(2019, 9, 30), "regroupement": "Mois", "valeur": "Somme",
+          "jours_couvrir": 30, "marge": 0.2}
 
-# Plan de la feuille Tableau de bord
-L_PANNEAU = 7          # première ligne des médicaments
-L_DEBUT, L_FIN, L_DISPO = None, None, None  # calculées dans construire()
-L_ENTETE_RESULTATS = 30
-COL_PERIODE = 2        # colonne B
+# Thème vert
+VERT_FONCE, VERT, VERT_MOYEN = "#1B5E20", "#2E7D32", "#43A047"
+VERT_PALE, VERT_SAISIE, VERT_BORD, GRIS = "#F1F8E9", "#DCEDC8", "#689F38", "#616161"
+VERT_BARRE = "#A5D6A7"  # barres dans les cellules : assez clair pour que le chiffre reste lisible
+LARGEUR_B, LARGEUR_C = 30, 12.5
+F_QTE, F_DATE, F_DATE_HEURE, F_PCT = "#,##0.00", "dd/mm/yyyy", "dd/mm/yyyy hh:mm", "0%"
 
 
-def lettre(col):
-    return get_column_letter(col)
+# ---------------------------------------------------------------------- Lecture du classeur source
+def lire_classeur(chemin):
+    """Valeurs, largeurs de colonnes et tableaux de chaque feuille de données."""
+    wb = load_workbook(chemin, data_only=True)
+    feuilles = []
+    for ws in wb.worksheets:
+        if ws.title in GENEREES:
+            continue
+        lignes = [list(r) for r in ws.iter_rows(values_only=True)]
+        while lignes and all(v is None for v in lignes[-1]):
+            lignes.pop()
+        tables = [(nom, ws.tables[nom].ref, ws.tables[nom].tableStyleInfo) for nom in ws.tables]
+        largeurs = {k: d.width for k, d in ws.column_dimensions.items() if d.width}
+        feuilles.append({"nom": ws.title, "lignes": lignes, "tables": tables, "largeurs": largeurs})
+    return feuilles
 
 
-def chaine_date(ref):
-    """Date au format jj/mm/aaaa, construite sans TEXTE() pour ne pas dépendre de la langue d'Excel."""
-    return f'RIGHT("0"&DAY({ref}),2)&"/"&RIGHT("0"&MONTH({ref}),2)&"/"&YEAR({ref})'
+def colonnes(feuille, noms_requis):
+    entete = feuille["lignes"][0]
+    manquants = [n for n in noms_requis if n not in entete]
+    if manquants:
+        raise SystemExit(f"Colonnes {manquants} introuvables dans {feuille['nom']}")
+    return {n: entete.index(n) for n in entete if n is not None}
 
 
-def choisir(index, valeurs):
-    return f"CHOOSE({index}," + ",".join(f'"{v}"' for v in valeurs) + ")"
+def nombre(v):
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
 
 
-def entete(ws, cellule, texte, largeur=1):
-    ws[cellule] = texte
-    c = ws[cellule]
-    c.font = Font(bold=True, color="FFFFFF", size=11)
-    c.fill = PatternFill("solid", fgColor=FOND_ENTETE)
-    c.alignment = Alignment(vertical="center", indent=1)
-    if largeur > 1:
-        ligne, col = c.row, c.column
-        for j in range(col + 1, col + largeur):
-            ws.cell(ligne, j).fill = PatternFill("solid", fgColor=FOND_ENTETE)
+def serie(d):
+    """Date au format numéro de série Excel (valeur pré-calculée d'une formule qui renvoie une date)."""
+    if isinstance(d, datetime):
+        return (d - datetime(1899, 12, 30)).total_seconds() / 86400
+    return (d - date(1899, 12, 30)).days
 
 
-def saisie(cellule, valeur=None):
-    """Cellule que l'utilisateur modifie : fond jaune, cadre, non verrouillée."""
-    if valeur is not None:
-        cellule.value = valeur
-    cellule.fill = PatternFill("solid", fgColor=FOND_SAISIE)
-    cellule.border = CADRE
-    cellule.protection = Protection(locked=False)
-    cellule.font = Font(bold=True, color=BLEU_FONCE)
-    cellule.alignment = Alignment(horizontal="center", vertical="center")
+def jour_seul(v):
+    return v.date() if isinstance(v, datetime) else v
 
 
-def nommer(wb, nom, ref):
-    if nom in wb.defined_names:
-        del wb.defined_names[nom]
-    wb.defined_names[nom] = DefinedName(nom, attr_text=ref)
+# ---------------------------------------------------------------------- Calcul des valeurs affichées
+def calculer(jours, heures, codes, entrees):
+    """Reproduit en Python les formules du classeur pour les valeurs d'ouverture (même logique, mêmes cas)."""
+    debut, fin = entrees["debut"], entrees["fin"]
+    g = REGROUPEMENTS.index(entrees["regroupement"]) + 1
+    par_jour = entrees["valeur"] == "Moyenne par jour"
+    inclus = entrees["inclus"]
+    lundi = debut - timedelta(days=debut.isoweekday() - 1)
+
+    if fin < debut:
+        nb_lignes = 0
+    else:
+        nb_lignes = [(fin - debut).days + 1, (fin - lundi).days // 7 + 1,
+                     (fin.year - debut.year) * 12 + fin.month - debut.month + 1,
+                     fin.year - debut.year + 1, 7, 24][g - 1]
+    nb_aff = min(nb_lignes, MAX_LIGNES)
+
+    j = []  # une entrée par jour, comme la feuille Jours
+    for d, valeurs in jours:
+        dans = debut <= d <= fin
+        if not dans:
+            cle = 0
+        else:
+            cle = [(d - debut).days + 1, (d - lundi).days // 7 + 1,
+                   (d.year - debut.year) * 12 + d.month - debut.month + 1,
+                   d.year - debut.year + 1, d.isoweekday(), 0][g - 1]
+        sel = sum(valeurs[c] for c in codes if inclus[c]) if dans else ""
+        j.append({"date": d, "jsem": d.isoweekday(), "mois": d.month, "dans": int(dans), "cle": cle, "sel": sel,
+                  "valeurs": valeurs})
+
+    nb_jours = sum(x["dans"] for x in j)
+    total = sum(x["sel"] for x in j if x["dans"])
+    max_jour = max([x["sel"] for x in j if x["dans"]], default=0)
+    meilleur = next((x["date"] for x in j if x["dans"] and x["sel"] == max_jour), None) if max_jour > 0 else None
+
+    meds = {}
+    for c in codes:
+        tot = sum(x["valeurs"][c] for x in j if x["dans"])
+        moy_jsem = []
+        for k in range(1, 8):
+            v = [x["valeurs"][c] for x in j if x["jsem"] == k]
+            moy_jsem.append(sum(v) / len(v) if v else 0)
+        moy_mois = []
+        for m in range(1, 13):
+            v = [x["valeurs"][c] for x in j if x["mois"] == m]
+            moy_mois.append(sum(v) / len(v) if v else 0)
+        meds[c] = {"total": tot, "moy": tot / nb_jours if nb_jours else 0, "jsem": moy_jsem, "mois": moy_mois,
+                   "meilleur_jsem": JOURS[moy_jsem.index(max(moy_jsem))],
+                   "meilleur_mois": MOIS[moy_mois.index(max(moy_mois))]}
+
+    def dans_heures(dt):
+        return debut <= dt.date() < fin + timedelta(days=1)
+
+    lignes = []
+    for i in range(1, MAX_LIGNES + 1):
+        actif = i <= nb_aff
+        if not actif:
+            lignes.append({"actif": 0})
+            continue
+        if g == 1:
+            debut_l = debut + timedelta(days=i - 1)
+        elif g == 2:
+            debut_l = lundi + timedelta(days=7 * (i - 1))
+        elif g == 3:
+            m0 = debut.month - 1 + i - 1
+            debut_l = date(debut.year + m0 // 12, m0 % 12 + 1, 1)
+        elif g == 4:
+            debut_l = date(debut.year + i - 1, 1, 1)
+        else:
+            debut_l = i if g == 5 else i - 1
+        libelle = [lambda: f"{JOURS_COURTS[debut_l.isoweekday() - 1]} {debut_l:%d/%m/%Y}",
+                   lambda: f"Semaine du {debut_l:%d/%m/%Y}", lambda: f"{MOIS[debut_l.month - 1]} {debut_l.year}",
+                   lambda: f"{debut_l.year}", lambda: JOURS[i - 1], lambda: f"{i - 1:02d}h"][g - 1]()
+        if g <= 5:
+            selection = [x for x in j if x["cle"] == i]
+            nb = len(selection)
+            sommes = {c: sum(x["valeurs"][c] for x in selection) for c in codes}
+        else:
+            selection = [h for h in heures if h[1] == i - 1 and dans_heures(h[0])]
+            nb = len(selection)
+            sommes = {c: sum(h[2][c] for h in selection) for c in codes}
+        valeurs = {c: (sommes[c] / max(1, nb) if par_jour else sommes[c]) if inclus[c] else "" for c in codes}
+        tot_ligne = sum(v for v in valeurs.values() if v != "")
+        lignes.append({"actif": 1, "debut": debut_l, "libelle": libelle, "valeurs": valeurs, "total": tot_ligne,
+                       "nb": nb, "x": debut_l if g <= 4 else "#N/A", "y": tot_ligne if g <= 4 else "#N/A"})
+
+    profil_jsem = []
+    for k in range(1, 8):
+        v = [x["sel"] for x in j if x["dans"] and x["jsem"] == k]
+        profil_jsem.append(sum(v) / len(v) if v else 0)
+    profil_heure = []
+    for h in range(24):
+        v = [sum(vals[c] for c in codes if inclus[c]) for dt, heure, vals in heures if heure == h and dans_heures(dt)]
+        profil_heure.append(sum(v) / len(v) if v else 0)
+
+    return {"g": g, "lundi": lundi, "nb_lignes": nb_lignes, "nb_aff": nb_aff, "par_jour": int(par_jour),
+            "nb_jours": nb_jours, "total": total, "max_jour": max_jour, "meilleur": meilleur, "jours": j,
+            "meds": meds, "lignes": lignes, "profil_jsem": profil_jsem, "profil_heure": profil_heure}
 
 
-def titre_graphique(texte):
-    """Titre de graphique sobre (11 pt) plutôt que le titre 14 pt par défaut."""
-    police = CharacterProperties(sz=1100, b=True, solidFill=BLEU_FONCE)
-    paragraphe = Paragraph(pPr=ParagraphProperties(defRPr=police), r=[RegularTextRun(rPr=police, t=texte)])
-    return Title(tx=Text(rich=RichText(p=[paragraphe])), overlay=False)
+# ---------------------------------------------------------------------- Écriture
+def construire(source, sortie):
+    feuilles = lire_classeur(source)
+    par_nom = {f["nom"]: f for f in feuilles}
+    if JOUR not in par_nom or HEURE not in par_nom:
+        raise SystemExit(f"Feuilles {JOUR} et {HEURE} introuvables dans {source}")
+    entete_j = par_nom[JOUR]["lignes"][0]
+    codes = [c for c in entete_j if isinstance(c, str) and CODE_ATC.fullmatch(c)]
+    cj = colonnes(par_nom[JOUR], ["datum", *codes])
+    ch = colonnes(par_nom[HEURE], ["datum", "Hour", *codes])
 
+    jours = [(jour_seul(r[cj["datum"]]), {c: nombre(r[cj[c]]) for c in codes})
+             for r in par_nom[JOUR]["lignes"][1:] if r[cj["datum"]] is not None]
+    heures = [(r[ch["datum"]], int(r[ch["Hour"]]), {c: nombre(r[ch[c]]) for c in codes})
+              for r in par_nom[HEURE]["lignes"][1:] if r[ch["datum"]] is not None]
+    nd, nh = len(par_nom[JOUR]["lignes"]), len(par_nom[HEURE]["lignes"])  # dernière ligne Excel
+    n = len(codes)
 
-def axes_visibles(graphe):
-    # openpyxl masque les axes par défaut dans les versions récentes d'Excel
-    graphe.x_axis.delete = False
-    graphe.y_axis.delete = False
+    entrees = dict(DEFAUT, inclus={c: True for c in codes})
+    v = calculer(jours, heures, codes, entrees)
 
+    # Plages des données (références simples, valables dans tous les tableurs)
+    def plage(feuille, col, fin_ligne):
+        lettre = xl_col_to_name(col)
+        return f"{feuille}!${lettre}$2:${lettre}${fin_ligne}"
+    D_DATE = plage(JOUR, cj["datum"], nd)
+    D = {c: plage(JOUR, cj[c], nd) for c in codes}
+    H_DATE, H_HEURE = plage(HEURE, ch["datum"], nh), plage(HEURE, ch["Hour"], nh)
+    H = {c: plage(HEURE, ch[c], nh) for c in codes}
+    J = {col: f"{JOURS_F}!${col}$2:${col}${len(jours) + 1}" for col in "ABCDEF"}
+    TDB = f"'{FEUILLE}'"
 
-def construire(chemin, sortie):
-    wb = load_workbook(chemin)
-    for nom in (FEUILLE, CALCULS):
-        if nom in wb.sheetnames:
-            del wb[nom]
-    if JOUR not in wb.sheetnames or HEURE not in wb.sheetnames:
-        raise SystemExit(f"Feuilles {JOUR} et {HEURE} introuvables dans {chemin}")
+    dossier = Path(sortie).resolve().parent
+    tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", dir=dossier, delete=False)
+    tmp.close()
+    wb = xlsxwriter.Workbook(tmp.name)
+    fm = {}
 
-    entetes = [c.value for c in wb[JOUR][1]]
-    codes = [c for c in entetes if isinstance(c, str) and CODE_ATC.fullmatch(c)]
-    for colonne in ["datum", *codes]:
-        if colonne not in entetes:
-            raise SystemExit(f"Colonne {colonne} introuvable dans {JOUR}")
-    for colonne in ["datum", "Hour", *codes]:
-        if colonne not in [c.value for c in wb[HEURE][1]]:
-            raise SystemExit(f"Colonne {colonne} introuvable dans {HEURE}")
-    if len(codes) > len(PALETTE):
-        raise SystemExit(f"{len(codes)} médicaments : le tableau de bord en gère {len(PALETTE)} au maximum")
+    def fmt(**proprietes):
+        cle = tuple(sorted(proprietes.items()))
+        if cle not in fm:
+            fm[cle] = wb.add_format(dict(proprietes, font_name="Calibri", font_size=proprietes.get("font_size", 11)))
+        return fm[cle]
 
-    ws = wb.create_sheet(FEUILLE, 0)
-    calc = wb.create_sheet(CALCULS)
-    wb.active = 0
-    for feuille in wb.worksheets:
-        feuille.sheet_view.tabSelected = feuille.title == FEUILLE
+    ws = wb.add_worksheet(FEUILLE)
 
-    J = lambda col: f"{JOUR}[{col}]"
-    H = lambda col: f"{HEURE}[{col}]"
-    dans_periode = f'{J("datum")},">="&Debut,{J("datum")},"<="&Fin'
+    # ---------------- feuilles de données recopiées telles quelles
+    for f in feuilles:
+        wd = wb.add_worksheet(f["nom"])
+        lignes = f["lignes"]
+        avec_heure = {}
+        for c in range(len(lignes[0])):
+            vals = [r[c] for r in lignes[1:] if c < len(r) and isinstance(r[c], datetime)]
+            avec_heure[c] = any(x.hour or x.minute for x in vals)
+        for r, ligne in enumerate(lignes):
+            for c, val in enumerate(ligne):
+                if val is None:
+                    continue
+                if isinstance(val, datetime):
+                    wd.write_datetime(r, c, val, fmt(num_format=F_DATE_HEURE if avec_heure[c] else F_DATE))
+                elif isinstance(val, date):
+                    wd.write_number(r, c, serie(val), fmt(num_format=F_DATE))
+                elif isinstance(val, bool):
+                    wd.write_boolean(r, c, val)
+                elif isinstance(val, (int, float)):
+                    wd.write_number(r, c, val)
+                else:
+                    wd.write_string(r, c, str(val))
+        for nom_t, ref, _style in f["tables"]:
+            premiere, derniere = ref.split(":")
+            debut_c = re.match(r"([A-Z]+)(\d+)", premiere)
+            fin_c = re.match(r"([A-Z]+)(\d+)", derniere)
+            r0, r1 = int(debut_c[2]) - 1, int(fin_c[2]) - 1
+            c0 = sum((ord(ch_) - 64) * 26 ** k for k, ch_ in enumerate(reversed(debut_c[1]))) - 1
+            c1 = sum((ord(ch_) - 64) * 26 ** k for k, ch_ in enumerate(reversed(fin_c[1]))) - 1
+            entetes = [str(lignes[r0][c]) for c in range(c0, c1 + 1)]
+            wd.add_table(r0, c0, r1, c1, {"name": nom_t, "style": "Table Style Medium 7",
+                                          "columns": [{"header": h} for h in entetes]})
+        for c in range(len(lignes[0])):
+            lettre = xl_col_to_name(c)
+            largeur = f["largeurs"].get(lettre) or (17 if avec_heure.get(c) else 12)
+            wd.set_column(c, c, largeur)
+        wd.freeze_panes(1, 0)
 
-    # ------------------------------------------------------------------ Titre et mode d'emploi
-    ws.sheet_view.showGridLines = False
-    ws.sheet_view.zoomScale = 90
-    ws["B2"] = "Ventes de la pharmacie : tableau de bord"
-    ws["B2"].font = Font(bold=True, size=20, color=BLEU_FONCE)
-    ws["B3"] = ("Choisissez les médicaments, la période et le regroupement dans les cellules jaunes : "
-                "tout se met à jour automatiquement.")
-    ws["B3"].font = Font(italic=True, color=GRIS_TEXTE)
+    calc = wb.add_worksheet(CALCULS)
+    wj = wb.add_worksheet(JOURS_F)
 
-    # ------------------------------------------------------------------ ① Médicaments
-    entete(ws, "B5", "① Médicaments", 5)
-    for j, titre in enumerate(["Médicament", "Inclure", "Total période", "Moyenne / jour", "Part"], start=2):
-        c = ws.cell(6, j, titre)
-        c.font = Font(bold=True, color=GRIS_TEXTE, size=9)
-        c.alignment = Alignment(horizontal="left" if j == 2 else "center")
-        c.border = Border(bottom=TRAIT)
-    lignes_med = {}
+    # ---------------- plan de l'onglet Tableau de bord (lignes Excel, 1 = première ligne)
+    L_MED = 8                       # premier médicament
+    L_TOT = L_MED + n               # total de la sélection
+    L_PER = L_TOT + 2               # en-tête « Période et affichage »
+    L_DU, L_AU, L_REG, L_VAL, L_DISPO = L_PER + 1, L_PER + 2, L_PER + 3, L_PER + 4, L_PER + 5
+    L_MSG = max(L_DISPO + 1, 24)
+    L_GRAPH = L_MSG + 2             # bande des graphiques
+    L_ACH = L_GRAPH + 34            # bande du tableau des achats
+    L_RES = L_ACH + 7 + n           # bande des résultats détaillés
+    C_DEB, C_FIN = f"$C${L_DU}", f"$C${L_AU}"
+
+    # Calculs : paramètres (lignes 2 à 11), médicaments (17…), périodes (28…), profils
+    P = {"debut": "$B$2", "fin": "$B$3", "g": "$B$4", "lundi": "$B$5", "nb_lignes": "$B$6", "nb_aff": "$B$7",
+         "par_jour": "$B$8", "nb_jours": "$B$9", "total": "$B$10", "max": "$B$11"}
+    CP = {k: f"{CALCULS}!{ref}" for k, ref in P.items()}
+    L_CMED = 17
+    FLAG = {c: f"{CALCULS}!$B${L_CMED + i}" for i, c in enumerate(codes)}
+    L_CPER = 28
+    crit_heure = f'{H_DATE},">="&{CP["debut"]},{H_DATE},"<"&({CP["fin"]}+1)'
+
+    def chaine_date(ref):
+        return f'RIGHT("0"&DAY({ref}),2)&"/"&RIGHT("0"&MONTH({ref}),2)&"/"&YEAR({ref})'
+
+    def choix(index, valeurs):
+        return f"CHOOSE({index}," + ",".join(f'"{x}"' for x in valeurs) + ")"
+
+    # ================================================================== Feuille Jours (masquée)
+    for c, titre in enumerate(["Date", "Jour semaine", "Mois", "Dans la période", "Ligne du résultat",
+                               "Ventes de la sélection"]):
+        wj.write(0, c, titre, fmt(bold=True))
+    somme_sel = lambda r: "+".join(f"{JOUR}!{xl_col_to_name(cj[c])}{r}*{FLAG[c]}" for c in codes)
+    for k, x in enumerate(v["jours"]):
+        r = k + 2
+        wj.write_formula(r - 1, 0, f"={JOUR}!{xl_col_to_name(cj['datum'])}{r}", fmt(num_format=F_DATE),
+                         serie(x["date"]))
+        wj.write_formula(r - 1, 1, f"=WEEKDAY(A{r},2)", None, x["jsem"])
+        wj.write_formula(r - 1, 2, f"=MONTH(A{r})", None, x["mois"])
+        wj.write_formula(r - 1, 3, f"=IF(AND(A{r}>={CP['debut']},A{r}<={CP['fin']}),1,0)", None, x["dans"])
+        wj.write_formula(r - 1, 4, f"=IF(D{r}=0,0,CHOOSE({CP['g']},A{r}-{CP['debut']}+1,"
+                                   f"INT((A{r}-{CP['lundi']})/7)+1,"
+                                   f"(YEAR(A{r})-YEAR({CP['debut']}))*12+MONTH(A{r})-MONTH({CP['debut']})+1,"
+                                   f"YEAR(A{r})-YEAR({CP['debut']})+1,B{r},0))", None, x["cle"])
+        wj.write_formula(r - 1, 5, f'=IF(D{r}=0,"",{somme_sel(r)})', None, x["sel"])
+    wj.set_column(0, 5, 14)
+    wj.hide()
+
+    # ================================================================== Feuille Calculs (masquée)
+    calc.write(0, 0, "Paramètre", fmt(bold=True))
+    calc.write(0, 1, "Valeur", fmt(bold=True))
+    reg = f"{TDB}!$C${L_REG}"
+    num_reg = "".join(f'IF({reg}="{r}",{i},' for i, r in enumerate(REGROUPEMENTS, 1)) + "3" + ")" * 6
+    parametres = [
+        ("Début", f"={TDB}!{C_DEB}", serie(DEFAUT["debut"]), F_DATE),
+        ("Fin", f"={TDB}!{C_FIN}", serie(DEFAUT["fin"]), F_DATE),
+        ("N° de regroupement", "=" + num_reg, v["g"], None),
+        ("Lundi de la 1re semaine", f"={P['debut']}-WEEKDAY({P['debut']},2)+1",
+         serie(v["lundi"]), F_DATE),
+        ("Nombre de lignes", f"=IF({P['fin']}<{P['debut']},0,CHOOSE({P['g']},{P['fin']}-{P['debut']}+1,"
+                             f"INT(({P['fin']}-{P['lundi']})/7)+1,"
+                             f"(YEAR({P['fin']})-YEAR({P['debut']}))*12+MONTH({P['fin']})-MONTH({P['debut']})+1,"
+                             f"YEAR({P['fin']})-YEAR({P['debut']})+1,7,24))", v["nb_lignes"], None),
+        ("Lignes affichées", f"=MIN({P['nb_lignes']},{MAX_LIGNES})", v["nb_aff"], None),
+        ("Moyenne par jour ?", f'=IF({TDB}!$C${L_VAL}="Moyenne par jour",1,0)', v["par_jour"], None),
+        ("Jours dans la période", f"=SUM({J['D']})", v["nb_jours"], None),
+        ("Ventes de la sélection", f"=SUM({J['F']})", v["total"], None),
+        ("Meilleur jour (quantité)", f"=MAX({J['F']})", v["max_jour"], None),
+    ]
+    for i, (libelle, formule, valeur, nf) in enumerate(parametres, start=1):
+        calc.write(i, 0, libelle)
+        calc.write_formula(i, 1, formule, fmt(num_format=nf) if nf else None, valeur)
+
+    entetes_med = (["Code", "Inclus", "Total période", "Moyenne / jour"] + [f"Moy. {j_[:3]}." for j_ in JOURS]
+                   + [f"Moy. {m[:4]}." for m in MOIS] + ["Jour le plus fort", "Mois le plus fort"])
+    for c, titre in enumerate(entetes_med):
+        calc.write(L_CMED - 2, c, titre, fmt(bold=True))
     for i, code in enumerate(codes):
-        r = L_PANNEAU + i
-        lignes_med[code] = r
-        ws.cell(r, 2, f"{code} · {NOMS.get(code, code)}").font = Font(color="000000")
-        ws.cell(r, 2).border = Border(left=Side(style="thick", color=PALETTE[i]))
-        saisie(ws.cell(r, 3), "Oui")
-        ws.cell(r, 4, f"=SUMIFS({J(code)},{dans_periode})").number_format = FMT_QTE
-        ws.cell(r, 5, f"=IF(NbJoursPeriode>0,D{r}/NbJoursPeriode,0)").number_format = FMT_QTE
-        ws.cell(r, 6, f'=IF(AND(C{r}="Oui",TotalSelection>0),D{r}/TotalSelection,"")').number_format = FMT_PCT
-    l_total = L_PANNEAU + len(codes)
-    plage_inclure = f"$C${L_PANNEAU}:$C${l_total - 1}"
-    ws.cell(l_total, 2, "Total de la sélection").font = Font(bold=True)
-    ws.cell(l_total, 4, f'=SUMPRODUCT(({plage_inclure}="Oui")*$D${L_PANNEAU}:$D${l_total - 1})')
-    ws.cell(l_total, 5, f"=IF(NbJoursPeriode>0,D{l_total}/NbJoursPeriode,0)")
-    for j in range(2, 7):
-        c = ws.cell(l_total, j)
-        c.font = Font(bold=True)
-        c.border = Border(top=TRAIT)
-        if j in (4, 5):
-            c.number_format = FMT_QTE
-    nommer(wb, "TotalSelection", f"'{FEUILLE}'!$D${l_total}")
+        r = L_CMED + i
+        m = v["meds"][code]
+        calc.write(r - 1, 0, code)
+        calc.write_formula(r - 1, 1, f'=IF({TDB}!$C${L_MED + i}="Oui",1,0)', None, 1)
+        calc.write_formula(r - 1, 2, f"=SUMIF({J['D']},1,{D[code]})", None, m["total"])
+        calc.write_formula(r - 1, 3, f"=IF({P['nb_jours']}>0,C{r}/{P['nb_jours']},0)", None, m["moy"])
+        for k in range(7):
+            calc.write_formula(r - 1, 4 + k, f"=IFERROR(AVERAGEIF({J['B']},{k + 1},{D[code]}),0)", None, m["jsem"][k])
+        for k in range(12):
+            calc.write_formula(r - 1, 11 + k, f"=IFERROR(AVERAGEIF({J['C']},{k + 1},{D[code]}),0)", None, m["mois"][k])
+        calc.write_formula(r - 1, 23, f"={choix(f'MATCH(MAX(E{r}:K{r}),E{r}:K{r},0)', JOURS)}", None,
+                           m["meilleur_jsem"])
+        calc.write_formula(r - 1, 24, f"={choix(f'MATCH(MAX(L{r}:W{r}),L{r}:W{r},0)', MOIS)}", None,
+                           m["meilleur_mois"])
 
-    # ------------------------------------------------------------------ Mode d'emploi
-    entete(ws, "H5", "Mode d'emploi", 5)
+    for c, titre in enumerate(["N°", "Affichée", "Début", "Libellé", "X graphique", "Y graphique"]):
+        calc.write(L_CPER - 2, c, titre, fmt(bold=True))
+    L_RES_DATA = L_RES + 2  # première ligne de données du tableau de résultats (onglet Tableau de bord)
+    col_tot, col_nb = 2 + n, 3 + n
+    l_tot, l_nb = xl_col_to_name(col_tot), xl_col_to_name(col_nb)
+    for i in range(1, MAX_LIGNES + 1):
+        r = L_CPER + i - 1
+        ligne = v["lignes"][i - 1]
+        rd = L_RES_DATA + i - 1
+        actif = ligne["actif"]
+        calc.write_number(r - 1, 0, i)
+        calc.write_formula(r - 1, 1, f"=IF(A{r}<={P['nb_aff']},1,0)", None, actif)
+        calc.write_formula(r - 1, 2, f'=IF(B{r}=0,"",CHOOSE({P["g"]},{P["debut"]}+A{r}-1,{P["lundi"]}+7*(A{r}-1),'
+                                     f'DATE(YEAR({P["debut"]}),MONTH({P["debut"]})+A{r}-1,1),'
+                                     f'DATE(YEAR({P["debut"]})+A{r}-1,1,1),A{r},A{r}-1))',
+                           fmt(num_format=F_DATE),
+                           (serie(ligne["debut"])
+                            if isinstance(ligne.get("debut"), date) else ligne.get("debut", "")) if actif else "")
+        libelle = (f'IF(B{r}=0,"",CHOOSE({P["g"]},'
+                   f'{choix(f"WEEKDAY(C{r},2)", JOURS_COURTS)}&" "&{chaine_date(f"C{r}")},'
+                   f'"Semaine du "&{chaine_date(f"C{r}")},'
+                   f'{choix(f"MONTH(C{r})", MOIS)}&" "&YEAR(C{r}),'
+                   f'""&YEAR(C{r}),{choix(f"A{r}", JOURS)},RIGHT("0"&(A{r}-1),2)&"h"))')
+        calc.write_formula(r - 1, 3, "=" + libelle, None, ligne["libelle"] if actif else "")
+        x = ligne["x"] if actif else "#N/A"
+        calc.write_formula(r - 1, 4, f"=IF(AND(B{r}=1,{P['g']}<=4),C{r},NA())", fmt(num_format=F_DATE),
+                           serie(x) if isinstance(x, date) else x)
+        calc.write_formula(r - 1, 5, f"=IF(AND(B{r}=1,{P['g']}<=4),{TDB}!${l_tot}${rd},NA())", None,
+                           ligne["y"] if actif else "#N/A")
+
+    calc.write(L_CPER - 2, 7, "Jour", fmt(bold=True))
+    calc.write(L_CPER - 2, 8, "Moyenne / jour", fmt(bold=True))
+    for k in range(7):
+        r = L_CPER + k
+        calc.write(r - 1, 7, JOURS_COURTS[k].capitalize())
+        calc.write_formula(r - 1, 8, f"=IFERROR(SUMIFS({J['F']},{J['B']},{k + 1},{J['D']},1)"
+                                     f"/COUNTIFS({J['B']},{k + 1},{J['D']},1),0)", None, v["profil_jsem"][k])
+    calc.write(L_CPER - 2, 10, "Heure", fmt(bold=True))
+    calc.write(L_CPER - 2, 11, "Moyenne / jour", fmt(bold=True))
+    for h in range(24):
+        r = L_CPER + h
+        somme = "+".join(f"$B${L_CMED + i}*SUMIFS({H[c]},{H_HEURE},{h},"
+                         f'{H_DATE},">="&{P["debut"]},{H_DATE},"<"&({P["fin"]}+1))'
+                         for i, c in enumerate(codes))
+        calc.write(r - 1, 10, f"{h:02d}h")
+        calc.write_formula(r - 1, 11, f'=IFERROR(({somme})/COUNTIFS({H_HEURE},{h},{H_DATE},">="&{P["debut"]},'
+                                      f'{H_DATE},"<"&({P["fin"]}+1)),0)', None, v["profil_heure"][h])
+    calc.set_column(0, 0, 24)
+    calc.set_column(3, 3, 24)
+    calc.hide()
+
+    # ================================================================== Tableau de bord
+    ws.hide_gridlines(2)
+    ws.set_zoom(90)
+    ws.set_column(0, 0, 2)
+    ws.set_column(1, 1, LARGEUR_B)
+    ws.set_column(2, 12, LARGEUR_C)
+    ws.set_column(13, 13, 2)
+    ws.set_row(0, 8)
+    ws.set_row(1, 26)
+    ws.set_row(2, 26)
+
+    titre_f = fmt(bold=True, font_size=20, font_color="#FFFFFF", bg_color=VERT_FONCE, valign="vcenter", indent=1)
+    ws.merge_range("B2:M3", "Ventes de la pharmacie : tableau de bord", titre_f)
+    ws.merge_range("B4:M4", "Modifiez les cellules vert clair : tout se met à jour automatiquement, sans macro.",
+                   fmt(italic=True, font_color=GRIS, valign="vcenter"))
+
+    entete_f = fmt(bold=True, font_color="#FFFFFF", bg_color=VERT, valign="vcenter", indent=1)
+    col_f = fmt(bold=True, font_size=9, font_color=GRIS, bottom=1, bottom_color=VERT_BORD, valign="bottom")
+    col_f_d = fmt(bold=True, font_size=9, font_color=GRIS, bottom=1, bottom_color=VERT_BORD, align="right",
+                  text_wrap=True, valign="bottom")
+    saisie = dict(bg_color=VERT_SAISIE, border=1, border_color=VERT_BORD, bold=True, font_color=VERT_FONCE,
+                  align="center", valign="vcenter", locked=False)
+    petit = fmt(font_size=9, font_color=GRIS)
+    qte = fmt(num_format=F_QTE)
+
+    # ---------------- ① Médicaments
+    ws.merge_range(f"B6:E6", "① Médicaments", entete_f)
+    for c, titre in zip("BCDE", ["Médicament", "Inclure", "Total période", "Part"]):
+        ws.write(f"{c}7", titre, col_f if c == "B" else col_f_d)
+    for i, code in enumerate(codes):
+        r = L_MED + i
+        m = v["meds"][code]
+        ws.write(f"B{r}", f"{code} · {NOMS.get(code, code)}")
+        ws.write(f"C{r}", "Oui", fmt(**saisie))
+        ws.write_formula(f"D{r}", f"={CALCULS}!$C${L_CMED + i}", qte, m["total"])
+        ws.write_formula(f"E{r}", f'=IF(AND({FLAG[code]}=1,{CP["total"]}>0),D{r}/{CP["total"]},"")',
+                         fmt(num_format=F_PCT), m["total"] / v["total"] if v["total"] else "")
+    tot_f = fmt(bold=True, top=1, top_color=VERT_BORD, num_format=F_QTE)
+    ws.write(f"B{L_TOT}", "Total de la sélection", fmt(bold=True, top=1, top_color=VERT_BORD))
+    ws.write(f"C{L_TOT}", "", tot_f)
+    ws.write_formula(f"D{L_TOT}", f"={CP['total']}", tot_f, v["total"])
+    ws.write(f"E{L_TOT}", "", tot_f)
+    ws.data_validation(f"C{L_MED}:C{L_TOT - 1}", {"validate": "list", "source": ["Oui", "Non"],
+                                                  "error_title": "Valeur non valide",
+                                                  "error_message": "Choisissez Oui ou Non."})
+    ws.conditional_format(f"B{L_MED}:E{L_TOT - 1}", {"type": "formula", "criteria": f'=$C{L_MED}="Non"',
+                                                     "format": fmt(font_color="#9E9E9E")})
+    ws.conditional_format(f"E{L_MED}:E{L_TOT - 1}", {"type": "data_bar", "bar_color": VERT_BARRE, "bar_solid": True,
+                                                     "min_type": "num", "min_value": 0,
+                                                     "max_type": "num", "max_value": 1})
+
+    # ---------------- ② Période et affichage
+    ws.merge_range(f"B{L_PER}:E{L_PER}", "② Période et affichage", entete_f)
+    ws.write(f"B{L_DU}", "Du")
+    ws.write(f"B{L_AU}", "Au")
+    ws.write(f"B{L_REG}", "Regrouper par")
+    ws.write(f"B{L_VAL}", "Valeur")
+    date_saisie = fmt(num_format=F_DATE, **saisie)
+    ws.write_number(f"C{L_DU}", serie(DEFAUT["debut"]), date_saisie)
+    ws.write_number(f"C{L_AU}", serie(DEFAUT["fin"]), date_saisie)
+    ws.merge_range(f"C{L_REG}:D{L_REG}", DEFAUT["regroupement"], fmt(**saisie))
+    ws.merge_range(f"C{L_VAL}:D{L_VAL}", DEFAUT["valeur"], fmt(**saisie))
+    ws.write(f"B{L_DISPO}", "Données disponibles", petit)
+    ws.write_formula(f"C{L_DISPO}", f"=MIN({D_DATE})", fmt(font_size=9, font_color=GRIS, num_format=F_DATE),
+                     serie(min(d for d, _ in jours)))
+    ws.write_formula(f"D{L_DISPO}", f"=MAX({D_DATE})", fmt(font_size=9, font_color=GRIS, num_format=F_DATE),
+                     serie(max(d for d, _ in jours)))
+    ws.data_validation(f"C{L_DU}:C{L_AU}", {"validate": "date", "criteria": "between",
+                                            "minimum": f"=$C${L_DISPO}", "maximum": f"=$D${L_DISPO}",
+                                            "error_title": "Date hors des données",
+                                            "error_message": "Choisissez une date comprise dans les données disponibles."})
+    ws.data_validation(f"C{L_REG}", {"validate": "list", "source": REGROUPEMENTS,
+                                     "error_title": "Valeur non valide", "error_message": "Choisissez dans la liste."})
+    ws.data_validation(f"C{L_VAL}", {"validate": "list", "source": VALEURS,
+                                     "error_title": "Valeur non valide", "error_message": "Choisissez dans la liste."})
+    message = (f'=IF({C_FIN}<{C_DEB},"⚠ La date de fin est avant la date de début.",'
+               f'IF(COUNTIF($C${L_MED}:$C${L_TOT - 1},"Oui")=0,"⚠ Aucun médicament inclus : mettez Oui devant au moins un médicament.",'
+               f'IF({CP["nb_lignes"]}>{MAX_LIGNES},"⚠ "&{CP["nb_lignes"]}&" lignes : seules les {MAX_LIGNES} premières '
+               f'sont affichées. Choisissez un regroupement plus large.","")))')
+    ws.merge_range(f"B{L_MSG}:M{L_MSG}", "", fmt(bold=True, font_color="#C62828"))
+    ws.write_formula(f"B{L_MSG}", message, fmt(bold=True, font_color="#C62828"), "")
+
+    # ---------------- ③ Chiffres clés (tuiles) et mode d'emploi
+    ws.merge_range("G6:M6", "③ Chiffres clés de la sélection", entete_f)
+    tuile = dict(bg_color=VERT_PALE)
+    tuiles = [
+        ("G", 7, "Quantité vendue", f"={CP['total']}", "#,##0", v["total"],
+         f'="sur "&{CP["nb_jours"]}&" jours"', f"sur {v['nb_jours']} jours"),
+        ("K", 7, "Moyenne par jour", f"=IF({CP['nb_jours']}>0,{CP['total']}/{CP['nb_jours']},0)", "#,##0.0",
+         v["total"] / v["nb_jours"] if v["nb_jours"] else 0, '="pour la sélection"', "pour la sélection"),
+        ("G", 12, "Meilleur jour",
+         f'=IF({CP["max"]}<=0,"—",INDEX({J["A"]},MATCH({CP["max"]},{J["F"]},0)))', F_DATE,
+         serie(v["meilleur"]) if v["meilleur"] else "—",
+         f'=IF({CP["max"]}<=0,"","avec "&FIXED({CP["max"]},0)&" ventes")',
+         f"avec {v['max_jour']:,.0f} ventes".replace(",", " ")),
+        ("K", 12, "Jours de données", f"={CP['nb_jours']}", "0", v["nb_jours"],
+         f'="du "&{chaine_date(C_DEB)}&" au "&{chaine_date(C_FIN)}',
+         f"du {DEFAUT['debut']:%d/%m/%Y} au {DEFAUT['fin']:%d/%m/%Y}"),
+    ]
+    for col, r, libelle, formule, nf, valeur, sous_formule, sous_valeur in tuiles:
+        c0 = ord(col) - 65
+        ws.merge_range(r - 1, c0, r - 1, c0 + 2, libelle, fmt(bold=True, font_size=9, font_color=GRIS, indent=1, **tuile))
+        ws.merge_range(r, c0, r + 1, c0 + 2, "", fmt(**tuile))
+        ws.write_formula(r, c0, formule, fmt(bold=True, font_size=20, font_color=VERT_FONCE,
+                                                          num_format=nf, valign="vcenter", indent=1, **tuile), valeur)
+        ws.merge_range(r + 2, c0, r + 2, c0 + 2, "", fmt(font_size=9, font_color=GRIS, indent=1, **tuile))
+        ws.write_formula(r + 2, c0, sous_formule, fmt(font_size=9, font_color=GRIS, indent=1, **tuile), sous_valeur)
+    ws.merge_range("G17:M17", "Mode d'emploi", entete_f)
     consignes = [
         "1. Mettez Oui ou Non devant chaque médicament.",
-        "2. Saisissez les dates de début et de fin.",
-        "3. Choisissez le regroupement et la valeur.",
-        "4. Lisez les indicateurs, le tableau et les graphiques.",
-        "",
-        "Seules les cellules jaunes sont modifiables.",
-        "Données lues dans Pharma_Ventes_Daily et",
-        "Pharma_Ventes_Hourly : rien à recopier.",
+        "2. Saisissez les dates Du et Au (jj/mm/aaaa).",
+        "3. Choisissez le regroupement et la valeur (somme ou moyenne par jour).",
+        "4. Lisez les chiffres clés, les graphiques et les résultats plus bas.",
+        "5. Tableau des achats : indiquez les jours à couvrir, la marge et vos stocks.",
+        "Seules les cellules vert clair sont modifiables.",
     ]
     for k, texte in enumerate(consignes):
-        ws.cell(6 + k, 8, texte).font = Font(size=10, color=GRIS_TEXTE, bold=k < 4)
+        ws.merge_range(17 + k, 6, 17 + k, 12, texte, fmt(font_size=10, font_color=GRIS, indent=1))
 
-    # ------------------------------------------------------------------ ② Période
-    l = l_total + 2
-    entete(ws, f"B{l}", "② Période", 5)
-    l_debut, l_fin, l_dispo = l + 1, l + 2, l + 3
-    ws[f"B{l_debut}"], ws[f"B{l_fin}"] = "Du", "Au"
-    saisie(ws[f"C{l_debut}"], datetime(2018, 1, 1))
-    saisie(ws[f"C{l_fin}"], datetime(2018, 12, 31))
-    for cellule in (f"C{l_debut}", f"C{l_fin}"):
-        ws[cellule].number_format = FMT_DATE
-        ws.merge_cells(f"{cellule}:{cellule.replace('C', 'D')}")
-    ws[f"B{l_dispo}"] = "Données disponibles"
-    ws[f"C{l_dispo}"] = f"=MIN({J('datum')})"
-    ws[f"D{l_dispo}"] = f"=MAX({J('datum')})"
-    for cellule in (f"B{l_dispo}", f"C{l_dispo}", f"D{l_dispo}"):
-        ws[cellule].font = Font(size=9, color=GRIS_TEXTE)
-        ws[cellule].number_format = FMT_DATE
-    nommer(wb, "Debut", f"'{FEUILLE}'!$C${l_debut}")
-    nommer(wb, "Fin", f"'{FEUILLE}'!$C${l_fin}")
+    # ---------------- ④ Graphiques (chacun ancré dans sa zone de cellules)
+    ws.merge_range(f"B{L_GRAPH}:M{L_GRAPH}", "④ Graphiques de la sélection", entete_f)
+    px_b, px_c = int(LARGEUR_B * 7 + 0.5) + 5, int(LARGEUR_C * 7 + 0.5) + 5
 
-    # ------------------------------------------------------------------ ③ Affichage
-    l = l_dispo + 2
-    entete(ws, f"B{l}", "③ Affichage", 5)
-    l_regroup, l_valeur = l + 1, l + 2
-    ws[f"B{l_regroup}"], ws[f"B{l_valeur}"] = "Regrouper par", "Valeur"
-    saisie(ws[f"C{l_regroup}"], "Mois")
-    saisie(ws[f"C{l_valeur}"], "Somme")
-    for cellule in (f"C{l_regroup}", f"C{l_valeur}"):
-        ws.merge_cells(f"{cellule}:{cellule.replace('C', 'D')}")
-    nommer(wb, "Regroupement", f"'{FEUILLE}'!$C${l_regroup}")
-    nommer(wb, "Valeur", f"'{FEUILLE}'!$C${l_valeur}")
-    l_message = l_valeur + 1
-    ws[f"B{l_message}"] = (
-        f'=IF(Fin<Debut,"⚠ La date de fin est avant la date de début.",'
-        f'IF(COUNTIF({plage_inclure},"Oui")=0,"⚠ Aucun médicament n\'est inclus.",'
-        f'IF(NbLignes>{MAX_LIGNES},"⚠ "&NbLignes&" lignes : seules les {MAX_LIGNES} premières sont affichées, '
-        f'choisissez un regroupement plus large.","")))'
-    )
-    ws[f"B{l_message}"].font = Font(bold=True, color="C00000")
-    assert l_message < L_ENTETE_RESULTATS - 1, "le panneau de saisie déborde sur le tableau de résultats"
+    def style_graphe(graphe, titre):
+        graphe.set_title({"name": titre, "name_font": {"size": 11, "bold": True, "color": VERT_FONCE}})
+        graphe.set_legend({"none": True})
+        graphe.set_chartarea({"border": {"color": "#C5E1A5"}})
+        graphe.set_y_axis({"min": 0, "num_format": "#,##0", "num_font": {"size": 9, "color": GRIS},
+                           "major_gridlines": {"visible": True, "line": {"color": "#E0E0E0"}},
+                           "line": {"none": True}})
 
-    # Listes déroulantes et contrôle des dates
-    dv_oui = DataValidation(type="list", formula1='"Oui,Non"', allow_blank=False,
-                            error="Choisissez Oui ou Non.", errorTitle="Valeur non valide")
-    dv_oui.add(plage_inclure.replace("$", ""))
-    dv_dates = DataValidation(type="date", operator="between", formula1=f"$C${l_dispo}", formula2=f"$D${l_dispo}",
-                              error="Choisissez une date comprise dans les données disponibles.",
-                              errorTitle="Date hors des données", showErrorMessage=True)
-    dv_dates.add(f"C{l_debut}")
-    dv_dates.add(f"C{l_fin}")
-    dv_regroup = DataValidation(type="list", formula1='"' + ",".join(REGROUPEMENTS) + '"', allow_blank=False,
-                                error="Choisissez un regroupement dans la liste.", errorTitle="Valeur non valide")
-    dv_regroup.add(f"C{l_regroup}")
-    dv_valeur = DataValidation(type="list", formula1='"' + ",".join(VALEURS) + '"', allow_blank=False,
-                               error="Choisissez une valeur dans la liste.", errorTitle="Valeur non valide")
-    dv_valeur.add(f"C{l_valeur}")
-    for dv in (dv_oui, dv_dates, dv_regroup, dv_valeur):
-        dv.showErrorMessage = True
-        ws.add_data_validation(dv)
+    r0, r1 = L_CPER - 1, L_CPER + MAX_LIGNES - 2
+    evolution = wb.add_chart({"type": "scatter", "subtype": "straight_with_markers"})
+    evolution.add_series({"name": "Sélection", "categories": [CALCULS, r0, 4, r1, 4], "values": [CALCULS, r0, 5, r1, 5],
+                          "line": {"color": VERT, "width": 2},
+                          "marker": {"type": "circle", "size": 5, "fill": {"color": VERT}, "border": {"color": VERT}}})
+    style_graphe(evolution, "Évolution des ventes (regroupement par jour, semaine, mois ou année)")
+    evolution.set_x_axis({"num_format": "mm/yyyy", "num_font": {"size": 9, "color": GRIS},
+                          "major_gridlines": {"visible": False}, "line": {"color": "#BDBDBD"}})
+    evolution.show_na_as_empty_cell()
+    evolution.set_size({"width": px_b + 11 * px_c - 12, "height": 16 * 20 - 8})
+    ws.insert_chart(f"B{L_GRAPH + 1}", evolution, {"x_offset": 6, "y_offset": 4})
 
-    # Médicaments exclus en gris
-    ws.conditional_formatting.add(
-        f"B{L_PANNEAU}:F{l_total - 1}",
-        FormulaRule(formula=[f'$C{L_PANNEAU}="Non"'], font=Font(color=GRIS_CLAIR), stopIfTrue=False))
-    ws.conditional_formatting.add(
-        f"F{L_PANNEAU}:F{l_total - 1}",
-        DataBarRule(start_type="num", start_value=0, end_type="num", end_value=1, color=BLEU, showValue=True))
-
-    # ------------------------------------------------------------------ Feuille de calculs (masquée)
-    # Ventes journalières de la sélection (somme des médicaments marqués Oui) et filtre de période
-    selection = "(" + "+".join(f'{J(code)}*(\'{FEUILLE}\'!$C${lignes_med[code]}="Oui")' for code in codes) + ")"
-    periode = f'({J("datum")}>=Debut)*({J("datum")}<=Fin)'
-    calc["A1"], calc["B1"] = "Paramètre", "Valeur"
-    parametres = [
-        ("N° de regroupement", "=IFERROR(MATCH(Regroupement,{" + ",".join(f'"{r}"' for r in REGROUPEMENTS) + "},0),3)",
-         "NumRegroupement"),
-        ("Lundi de la 1re semaine", "=Debut-WEEKDAY(Debut,2)+1", "LundiDebut"),
-        ("Nombre de lignes", "=IF(Fin<Debut,0,CHOOSE(NumRegroupement,Fin-Debut+1,INT((Fin-LundiDebut)/7)+1,"
-                             "(YEAR(Fin)-YEAR(Debut))*12+MONTH(Fin)-MONTH(Debut)+1,YEAR(Fin)-YEAR(Debut)+1,7,24))",
-         "NbLignes"),
-        ("Lignes affichées", f"=MIN(NbLignes,{MAX_LIGNES})", "NbAffichees"),
-        ("Moyenne par jour ?", '=Valeur="Moyenne par jour"', "ParJour"),
-        ("Jours de données", f"=COUNTIFS({dans_periode})", "NbJoursPeriode"),
-        ("Meilleur jour (quantité)", f"=SUMPRODUCT(MAX({selection}*{periode}))", "MaxJour"),
-    ]
-    for i, (libelle, formule, nom) in enumerate(parametres, start=2):
-        calc.cell(i, 1, libelle)
-        calc.cell(i, 2, formule)
-        nommer(wb, nom, f"{CALCULS}!$B${i}")
-
-    L0 = 10  # première ligne des périodes dans Calculs
-    for j, titre in enumerate(["N°", "Affichée", "Début", "Fin", "Début (borné)", "Fin (bornée)", "Libellé",
-                               "X graphique", "Y graphique"], start=1):
-        calc.cell(L0 - 1, j, titre).font = Font(bold=True)
-    libelle_jour = choisir("WEEKDAY(C{r},2)", ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."])
-    for i in range(1, MAX_LIGNES + 1):
-        r = L0 + i - 1
-        calc.cell(r, 1, i)
-        calc.cell(r, 2, f"=A{r}<=NbAffichees")
-        calc.cell(r, 3, f'=IF(NOT(B{r}),"",CHOOSE(NumRegroupement,Debut+A{r}-1,LundiDebut+7*(A{r}-1),'
-                        f'DATE(YEAR(Debut),MONTH(Debut)+A{r}-1,1),DATE(YEAR(Debut)+A{r}-1,1,1),A{r},A{r}-1))')
-        calc.cell(r, 4, f'=IF(NOT(B{r}),"",CHOOSE(NumRegroupement,C{r},C{r}+6,DATE(YEAR(C{r}),MONTH(C{r})+1,0),'
-                        f'DATE(YEAR(C{r}),12,31),C{r},C{r}))')
-        calc.cell(r, 5, f'=IF(NOT(B{r}),"",IF(NumRegroupement<=4,MAX(C{r},Debut),C{r}))')
-        calc.cell(r, 6, f'=IF(NOT(B{r}),"",IF(NumRegroupement<=4,MIN(D{r},Fin),D{r}))')
-        calc.cell(r, 7, f'=IF(NOT(B{r}),"",CHOOSE(NumRegroupement,'
-                        f'{libelle_jour.format(r=r)}&" "&{chaine_date(f"C{r}")},'
-                        f'"Semaine du "&{chaine_date(f"C{r}")},'
-                        f'{choisir(f"MONTH(C{r})", MOIS)}&" "&YEAR(C{r}),'
-                        f'""&YEAR(C{r}),'
-                        f'{choisir(f"A{r}", JOURS)},'
-                        f'RIGHT("0"&(A{r}-1),2)&"h"))')
-        rd = L_ENTETE_RESULTATS + i
-        calc.cell(r, 8, f"=IF(AND(B{r},NumRegroupement<=4),C{r},NA())").number_format = FMT_DATE
-        calc.cell(r, 9, f"=IF(AND(B{r},NumRegroupement<=4,ISNUMBER('{FEUILLE}'!K{rd})),'{FEUILLE}'!K{rd},NA())")
-
-    # Profils fixes : jour de la semaine (moyenne par jour) et heure (moyenne par jour), par médicament
-    L_PROFILS = L0 + MAX_LIGNES + 2
-    calc.cell(L_PROFILS - 1, 1, "Jour").font = Font(bold=True)
-    calc.cell(L_PROFILS - 1, 2, "Moyenne / jour").font = Font(bold=True)
-    for k, jour in enumerate(JOURS, start=1):
-        r = L_PROFILS + k - 1
-        meme_jour = f"(WEEKDAY({J('datum')},2)={k})"
-        calc.cell(r, 1, jour[:3] + ".")
-        calc.cell(r, 2, f"=IFERROR(SUMPRODUCT({meme_jour}*{periode}*{selection})"
-                        f"/SUMPRODUCT({meme_jour}*{periode}),0)")
-    L_HEURES = L_PROFILS + 9
-    calc.cell(L_HEURES - 1, 1, "Heure").font = Font(bold=True)
-    calc.cell(L_HEURES - 1, 2, "Moyenne / jour").font = Font(bold=True)
-    for h in range(24):
-        r = L_HEURES + h
-        criteres = f'{H("Hour")},{h},{H("datum")},">="&Debut,{H("datum")},"<"&Fin+1'
-        somme = "+".join(f'(\'{FEUILLE}\'!$C${lignes_med[code]}="Oui")*SUMIFS({H(code)},{criteres})' for code in codes)
-        calc.cell(r, 1, f"{h:02d}h")
-        calc.cell(r, 2, f"=IFERROR(({somme})/COUNTIFS({criteres}),0)")
-    L_PARTS = L_HEURES + 26
-    calc.cell(L_PARTS - 1, 1, "Médicament").font = Font(bold=True)
-    calc.cell(L_PARTS - 1, 2, "Total période").font = Font(bold=True)
-    for i, code in enumerate(codes):
-        r = L_PARTS + i
-        calc.cell(r, 1, code)
-        calc.cell(r, 2, f"=IF('{FEUILLE}'!C{lignes_med[code]}=\"Oui\",'{FEUILLE}'!D{lignes_med[code]},0)")
-    calc.column_dimensions["A"].width = 24
-    calc.column_dimensions["G"].width = 26
-    calc.sheet_state = "hidden"
-
-    # ------------------------------------------------------------------ Indicateurs (tuiles)
-    tuiles = [
-        ("N", "Quantité vendue", "=TotalSelection", FMT_QTE, '="sur "&NbJoursPeriode&" jours"'),
-        ("Q", "Moyenne par jour", "=IF(NbJoursPeriode>0,TotalSelection/NbJoursPeriode,0)", FMT_QTE,
-         '="pour la sélection"'),
-        ("T", "Meilleur jour", None, FMT_DATE, None),
-        ("W", "Jours de données", "=NbJoursPeriode", "0", '="du "&' + chaine_date("Debut") + '&" au "&'
-         + chaine_date("Fin")),
-    ]
-    for col, libelle, formule, fmt, sous_titre in tuiles:
-        c0 = ws[f"{col}5"].column
-        zone = [ws.cell(r, j) for r in range(5, 9) for j in range(c0, c0 + 3)]
-        for c in zone:
-            c.fill = PatternFill("solid", fgColor=FOND_TUILE)
-        ws.cell(5, c0, libelle).font = Font(size=9, bold=True, color=GRIS_TEXTE)
-        ws.merge_cells(start_row=6, start_column=c0, end_row=7, end_column=c0 + 2)
-        valeur = ws.cell(6, c0)
-        valeur.font = Font(size=20, bold=True, color=BLEU_FONCE)
-        valeur.alignment = Alignment(horizontal="left", vertical="center", indent=1)
-        valeur.number_format = fmt
-        if formule:
-            valeur.value = formule
-        if sous_titre:
-            ws.cell(8, c0, sous_titre).font = Font(size=9, color=GRIS_TEXTE)
-    # Meilleur jour : jour de la période où la sélection s'est le plus vendue
-    ws["T6"] = f'=IF(MaxJour<=0,"—",INDEX({J("datum")},MATCH(MaxJour,INDEX({selection}*{periode},0),0)))'
-    ws["T8"] = '=IF(MaxJour<=0,"","avec "&FIXED(MaxJour,2)&" ventes")'
-    ws["T8"].font = Font(size=9, color=GRIS_TEXTE)
-
-    # ------------------------------------------------------------------ Tableau des résultats
-    l = L_ENTETE_RESULTATS - 1
-    ws[f"B{l}"] = '="④ Résultats par "&LOWER(Regroupement)&IF(ParJour," (moyenne par jour)"," (somme)")'
-    ws[f"B{l}"].font = Font(bold=True, color="FFFFFF", size=11)
-    colonnes = ["Période", *codes, "Total sélection", "Nb jours"]
-    col_total, col_nb = 3 + len(codes), 4 + len(codes)
-    for j in range(2, col_nb + 1):
-        ws.cell(l, j).fill = PatternFill("solid", fgColor=FOND_ENTETE)
-    for j, titre in enumerate(colonnes, start=2):
-        c = ws.cell(L_ENTETE_RESULTATS, j, titre)
-        c.font = Font(bold=True, color=GRIS_TEXTE, size=9)
-        c.alignment = Alignment(horizontal="left" if j == 2 else "right")
-        c.border = Border(bottom=TRAIT)
-    lt, ln = lettre(col_total), lettre(col_nb)
-    for i in range(1, MAX_LIGNES + 1):
-        rc, rd = L0 + i - 1, L_ENTETE_RESULTATS + i
-        actif = f"{CALCULS}!$B{rc}"
-        debut_l, fin_l, num, cle = (f"{CALCULS}!$E{rc}", f"{CALCULS}!$F{rc}", f"{CALCULS}!$A{rc}", f"{CALCULS}!$C{rc}")
-        ws.cell(rd, 2, f'=IF({actif},{CALCULS}!$G{rc},"")')
-        jours_ligne = (f'COUNTIFS({J("datum")},">="&{debut_l},{J("datum")},"<="&{fin_l})',
-                       f'SUMPRODUCT((WEEKDAY({J("datum")},2)={num})*{periode})',
-                       f'COUNTIFS({H("Hour")},{cle},{H("datum")},">="&Debut,{H("datum")},"<"&Fin+1)')
-        ws.cell(rd, col_nb, f'=IF({actif},IF(NumRegroupement<=4,{jours_ligne[0]},'
-                                f'IF(NumRegroupement=5,{jours_ligne[1]},{jours_ligne[2]})),"")').number_format = "0"
-        for k, code in enumerate(codes):
-            ventes = (f'SUMIFS({J(code)},{J("datum")},">="&{debut_l},{J("datum")},"<="&{fin_l})',
-                      f'SUMPRODUCT((WEEKDAY({J("datum")},2)={num})*{periode}*{J(code)})',
-                      f'SUMIFS({H(code)},{H("Hour")},{cle},{H("datum")},">="&Debut,{H("datum")},"<"&Fin+1)')
-            formule = (f'=IF(AND({actif},$C${lignes_med[code]}="Oui"),'
-                       f'IF(NumRegroupement<=4,{ventes[0]},IF(NumRegroupement=5,{ventes[1]},{ventes[2]}))'
-                       f'/IF(ParJour,MAX(1,${ln}{rd}),1),"")')
-            ws.cell(rd, 3 + k, formule).number_format = FMT_QTE
-        ws.cell(rd, col_total, f'=IF({actif},SUM(C{rd}:{lettre(col_total - 1)}{rd}),"")').number_format = FMT_QTE
-        ws.cell(rd, col_total).font = Font(bold=True)
-    derniere = L_ENTETE_RESULTATS + MAX_LIGNES
-    ws.conditional_formatting.add(
-        f"{lt}{L_ENTETE_RESULTATS + 1}:{lt}{derniere}",
-        DataBarRule(start_type="num", start_value=0, end_type="max", color=BLEU, showValue=True))
-    for k, code in enumerate(codes):  # en-tête des médicaments exclus en gris
-        cellule = f"{lettre(3 + k)}{L_ENTETE_RESULTATS}"
-        ws.conditional_formatting.add(cellule, FormulaRule(
-            formula=[f'$C${lignes_med[code]}="Non"'], font=Font(color=GRIS_CLAIR)))
-    ws.conditional_formatting.add(  # une ligne sur deux légèrement grisée pour la lecture
-        f"B{L_ENTETE_RESULTATS + 1}:{ln}{derniere}",
-        FormulaRule(formula=[f'AND($B{L_ENTETE_RESULTATS + 1}<>"",MOD(ROW(),2)=0)'],
-                    fill=PatternFill("solid", fgColor="F7F7F7")))
-
-    # ------------------------------------------------------------------ Graphiques
-    evolution = ScatterChart()
-    evolution.title = titre_graphique("Évolution de la sélection (regroupement par jour, semaine, mois ou année)")
-    evolution.style = 2
-    evolution.legend = None
-    evolution.display_blanks = "gap"
-    serie = Series(Reference(calc, min_col=9, min_row=L0, max_row=L0 + MAX_LIGNES - 1),
-                   Reference(calc, min_col=8, min_row=L0, max_row=L0 + MAX_LIGNES - 1), title="Sélection")
-    serie.graphicalProperties.line.solidFill = BLEU
-    serie.graphicalProperties.line.width = 25400  # 2 pt
-    serie.marker = Marker(symbol="circle", size=5)
-    serie.marker.graphicalProperties = GraphicalProperties(solidFill=BLEU)
-    serie.marker.graphicalProperties.line.solidFill = BLEU
-    serie.smooth = False
-    evolution.series.append(serie)
-    evolution.x_axis.number_format = "dd/mm/yy"
-    evolution.x_axis.majorGridlines = None
-    evolution.y_axis.number_format = "#,##0"
-    evolution.y_axis.title = "Quantité"
-    evolution.y_axis.scaling.min = 0
-    axes_visibles(evolution)
-    evolution.width, evolution.height = 22.5, 9.5
-    ws.add_chart(evolution, "N10")
-
-    def barres(intitule, ligne, n, couleurs=None, horizontal=False):
-        g = BarChart()
-        g.type = "bar" if horizontal else "col"
-        g.title = titre_graphique(intitule)
-        g.style = 2
-        g.legend = None
-        g.gapWidth = 40
-        g.add_data(Reference(calc, min_col=2, min_row=ligne - 1, max_row=ligne + n - 1), titles_from_data=True)
-        g.set_categories(Reference(calc, min_col=1, min_row=ligne, max_row=ligne + n - 1))
-        s = g.series[0]
-        s.graphicalProperties.solidFill = BLEU
-        s.graphicalProperties.line.noFill = True
-        for idx, couleur in enumerate(couleurs or []):
-            point = DataPoint(idx=idx)
-            point.graphicalProperties.solidFill = couleur
-            point.graphicalProperties.line.noFill = True
-            s.dPt.append(point)
-        g.y_axis.number_format = "#,##0.0"
-        g.y_axis.scaling.min = 0  # des barres partent toujours de zéro
-        g.y_axis.majorGridlines = None if horizontal else g.y_axis.majorGridlines
-        axes_visibles(g)
+    def colonnes_graphe(titre, col_cat, col_val, nb, largeur_px):
+        g = wb.add_chart({"type": "column"})
+        g.add_series({"categories": [CALCULS, r0, col_cat, r0 + nb - 1, col_cat],
+                      "values": [CALCULS, r0, col_val, r0 + nb - 1, col_val],
+                      "fill": {"color": VERT_MOYEN}, "border": {"none": True}, "gap": 60})
+        style_graphe(g, titre)
+        g.set_y_axis({"min": 0, "num_format": "#,##0.0", "num_font": {"size": 9, "color": GRIS},
+                      "major_gridlines": {"visible": True, "line": {"color": "#E0E0E0"}}, "line": {"none": True}})
+        g.set_x_axis({"num_font": {"size": 9, "color": GRIS}, "line": {"color": "#BDBDBD"}})
+        g.set_size({"width": largeur_px, "height": 15 * 20 - 8})
         return g
 
-    profil_semaine = barres("Ventes moyennes selon le jour de la semaine", L_PROFILS, 7)
-    profil_semaine.width, profil_semaine.height = 11, 7.5
-    ws.add_chart(profil_semaine, "N29")
-    profil_heure = barres("Ventes moyennes par jour selon l'heure", L_HEURES, 24)
-    profil_heure.width, profil_heure.height = 11, 7.5
-    ws.add_chart(profil_heure, "T29")
-    parts = barres("Total de la période par médicament", L_PARTS, len(codes), PALETTE[:len(codes)], horizontal=True)
-    parts.x_axis.scaling.orientation = "maxMin"  # même ordre que la liste des médicaments
-    parts.series[0].dLbls = DataLabelList(showVal=True, showSerName=False, showCatName=False,
-                                          showLegendKey=False, showPercent=False, showLeaderLines=False)
-    parts.series[0].dLbls.numFmt = "#,##0;-#,##0;;"  # rien d'affiché pour les médicaments exclus (0)
-    parts.width, parts.height = 22.5, 7.5
-    ws.add_chart(parts, "N45")
+    ws.insert_chart(f"B{L_GRAPH + 18}", colonnes_graphe("Ventes moyennes selon le jour de la semaine", 7, 8, 7,
+                                                        px_b + 5 * px_c - 12), {"x_offset": 6, "y_offset": 4})
+    ws.insert_chart(f"H{L_GRAPH + 18}", colonnes_graphe("Ventes moyennes par jour selon l'heure", 10, 11, 24,
+                                                        6 * px_c - 12), {"x_offset": 6, "y_offset": 4})
 
-    # ------------------------------------------------------------------ Largeurs, protection, recalcul
-    largeurs = {"A": 2, "B": 30, lt: 14, ln: 9, "M": 3}
-    for k in range(len(codes)):
-        largeurs[lettre(3 + k)] = 12
-    for col in range(14, 26):
-        largeurs.setdefault(lettre(col), 9.5)
-    for col, largeur in largeurs.items():
-        ws.column_dimensions[col].width = largeur
-    ws.row_dimensions[2].height = 30
+    # ---------------- ⑤ Tableau des achats
+    ws.merge_range(f"B{L_ACH}:M{L_ACH}", "⑤ Tableau des achats", entete_f)
+    L_JC, L_MARGE, L_NOTE, L_ACH_T = L_ACH + 1, L_ACH + 2, L_ACH + 3, L_ACH + 4
+    ws.write(f"B{L_JC}", "Jours à couvrir")
+    ws.write_number(f"C{L_JC}", DEFAUT["jours_couvrir"], fmt(num_format="0", **saisie))
+    ws.write(f"D{L_JC}", "jours", petit)
+    ws.write(f"B{L_MARGE}", "Marge de sécurité")
+    ws.write_number(f"C{L_MARGE}", DEFAUT["marge"], fmt(num_format="0%", **saisie))
+    ws.data_validation(f"C{L_JC}", {"validate": "integer", "criteria": "between", "minimum": 1, "maximum": 365,
+                                    "error_title": "Valeur non valide", "error_message": "Entre 1 et 365 jours."})
+    ws.data_validation(f"C{L_MARGE}", {"validate": "decimal", "criteria": "between", "minimum": 0, "maximum": 2,
+                                       "error_title": "Valeur non valide", "error_message": "Entre 0 % et 200 %."})
+    note = (f'="Calcul : moyenne par jour du "&{chaine_date(C_DEB)}&" au "&{chaine_date(C_FIN)}'
+            f'&" × jours à couvrir × (1 + marge) − stock actuel, arrondi à l\'unité supérieure."')
+    ws.merge_range(f"B{L_NOTE}:M{L_NOTE}", "", petit)
+    ws.write_formula(f"B{L_NOTE}", note, petit,
+                     f"Calcul : moyenne par jour du {DEFAUT['debut']:%d/%m/%Y} au {DEFAUT['fin']:%d/%m/%Y} × jours "
+                     f"à couvrir × (1 + marge) − stock actuel, arrondi à l'unité supérieure.")
+    titres_achats = ["Médicament", "Moyenne / jour", None, "Marge de sécurité", "Stock actuel", "À commander",
+                     "Jour le plus fort", "Mois le plus fort"]
+    ws.set_row(L_ACH_T - 1, 30)
+    for k, titre in enumerate(titres_achats):
+        cellule = f"{chr(66 + k)}{L_ACH_T}"
+        if titre is None:
+            ws.write_formula(cellule, f'="Besoin sur "&$C${L_JC}&" jours"', col_f_d,
+                             f"Besoin sur {DEFAUT['jours_couvrir']} jours")
+        else:
+            ws.write(cellule, titre, col_f if k == 0 else col_f_d)
+    for i, code in enumerate(codes):
+        r = L_ACH_T + 1 + i
+        m = v["meds"][code]
+        besoin = m["moy"] * DEFAUT["jours_couvrir"]
+        marge = besoin * DEFAUT["marge"]
+        ws.write(f"B{r}", f"{code} · {NOMS.get(code, code)}")
+        ws.write_formula(f"C{r}", f"={CALCULS}!$D${L_CMED + i}", qte, m["moy"])
+        ws.write_formula(f"D{r}", f"=C{r}*$C${L_JC}", qte, besoin)
+        ws.write_formula(f"E{r}", f"=D{r}*$C${L_MARGE}", qte, marge)
+        ws.write_number(f"F{r}", 0, fmt(num_format="#,##0", **saisie))
+        ws.write_formula(f"G{r}", f"=ROUNDUP(MAX(0,D{r}+E{r}-F{r}),0)", fmt(bold=True, num_format="#,##0"),
+                         math.ceil(round(max(0, besoin + marge), 9)))
+        ws.write_formula(f"H{r}", f"={CALCULS}!$X${L_CMED + i}", fmt(align="right"), m["meilleur_jsem"])
+        ws.write_formula(f"I{r}", f"={CALCULS}!$Y${L_CMED + i}", fmt(align="right"), m["meilleur_mois"])
+        ws.conditional_format(f"B{r}:I{r}", {"type": "formula", "criteria": f'=$C${L_MED + i}="Non"',
+                                             "format": fmt(font_color="#9E9E9E")})
+    L_ACH_FIN = L_ACH_T + n
+    ws.data_validation(f"F{L_ACH_T + 1}:F{L_ACH_FIN}", {"validate": "decimal", "criteria": ">=", "value": 0,
+                                                       "error_title": "Valeur non valide",
+                                                       "error_message": "Le stock doit être positif ou nul."})
+    ws.conditional_format(f"G{L_ACH_T + 1}:G{L_ACH_FIN}", {"type": "data_bar", "bar_color": VERT_BARRE,
+                                                          "bar_solid": True, "min_type": "num", "min_value": 0})
+    ws.write(f"B{L_ACH_FIN + 1}", "Jour et mois les plus forts : moyenne par jour sur tout l'historique des ventes.",
+             petit)
 
-    # Impression : le tableau de bord tient sur une page paysage (le détail des résultats suit)
-    ws.print_area = "A1:Y60"
-    ws.page_setup.orientation = "landscape"
-    ws.page_setup.paperSize = ws.PAPERSIZE_A4
-    ws.sheet_properties.pageSetUpPr.fitToPage = True
-    ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 1
+    # ---------------- ⑥ Résultats détaillés
+    titre_res = f'="⑥ Résultats par "&LOWER($C${L_REG})&IF({CP["par_jour"]}=1," (moyenne par jour)"," (somme)")'
+    ws.merge_range(f"B{L_RES}:L{L_RES}", "", entete_f)
+    ws.write_formula(f"B{L_RES}", titre_res, entete_f,
+                     f"⑥ Résultats par {DEFAUT['regroupement'].lower()} "
+                     f"({'moyenne par jour' if v['par_jour'] else 'somme'})")
+    ws.set_row(L_RES, 30)
+    for k, titre in enumerate(["Période", *codes, "Total sélection", "Nb jours"]):
+        ws.write(L_RES, 1 + k, titre, col_f if k == 0 else col_f_d)
+    for i in range(1, MAX_LIGNES + 1):
+        rr = L_CPER + i - 1
+        rd = L_RES_DATA + i - 1
+        ligne = v["lignes"][i - 1]
+        actif = f"{CALCULS}!$B${rr}"
+        num = f"{CALCULS}!$A${rr}"
+        ws.write_formula(rd - 1, 1, f'=IF({actif}=1,{CALCULS}!$D${rr},"")', None,
+                         ligne["libelle"] if ligne["actif"] else "")
+        ws.write_formula(rd - 1, col_nb, f'=IF({actif}=0,"",IF({CP["g"]}<=5,COUNTIF({J["E"]},{num}),'
+                                         f'COUNTIFS({H_HEURE},{num}-1,{crit_heure})))', fmt(num_format="0"),
+                         ligne["nb"] if ligne["actif"] else "")
+        for k, code in enumerate(codes):
+            formule = (f'=IF(OR({actif}=0,{FLAG[code]}=0),"",IF({CP["g"]}<=5,SUMIF({J["E"]},{num},{D[code]}),'
+                       f'SUMIFS({H[code]},{H_HEURE},{num}-1,{crit_heure}))'
+                       f'/IF({CP["par_jour"]}=1,MAX(1,${l_nb}{rd}),1))')
+            ws.write_formula(rd - 1, 2 + k, formule, qte, ligne["valeurs"][code] if ligne["actif"] else "")
+        ws.write_formula(rd - 1, col_tot, f'=IF({actif}=0,"",SUM(C{rd}:{xl_col_to_name(col_tot - 1)}{rd}))',
+                         fmt(bold=True, num_format=F_QTE), ligne["total"] if ligne["actif"] else "")
+    derniere = L_RES_DATA + MAX_LIGNES - 1
+    ws.conditional_format(f"{l_tot}{L_RES_DATA}:{l_tot}{derniere}",
+                          {"type": "data_bar", "bar_color": VERT_BARRE, "bar_solid": True,
+                           "min_type": "num", "min_value": 0})
+    ws.conditional_format(f"B{L_RES_DATA}:{l_nb}{derniere}",
+                          {"type": "formula", "criteria": f'=AND($B{L_RES_DATA}<>"",MOD(ROW(),2)=0)',
+                           "format": fmt(bg_color=VERT_PALE)})
+    for k, code in enumerate(codes):
+        cellule = f"{xl_col_to_name(2 + k)}{L_RES + 1}"
+        ws.conditional_format(cellule, {"type": "formula", "criteria": f'=$C${L_MED + k}="Non"',
+                                        "format": fmt(font_color="#BDBDBD")})
 
-    ws.protection.sheet = True  # sans mot de passe : Révision > Ôter la protection pour modifier
-    ws.protection.formatColumns = False
-    ws.protection.formatRows = False
-    wb.calculation.fullCalcOnLoad = True
-    wb.save(sortie)
-    print(f"Tableau de bord ajouté : {sortie} ({len(codes)} médicaments, {MAX_LIGNES} lignes de résultats)")
+    # ---------------- impression, protection, ouverture
+    ws.print_area(f"A1:M{L_RES - 2}")
+    ws.set_landscape()
+    ws.set_paper(9)
+    ws.fit_to_pages(1, 0)
+    ws.protect("", {"select_locked_cells": True, "select_unlocked_cells": True})
+    ws.activate()
+    wb.close()
+    os.replace(tmp.name, sortie)
+    print(f"Classeur écrit : {sortie} ({n} médicaments, {len(jours)} jours, {len(heures)} heures)")
+    return v
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ajoute l'onglet Tableau de bord dans le classeur des ventes.")
-    parser.add_argument("--excel", type=Path, default=EXCEL_PAR_DEFAUT, help="classeur à compléter")
+    parser = argparse.ArgumentParser(description="Construit le classeur des ventes avec son tableau de bord.")
+    parser.add_argument("--excel", type=Path, default=EXCEL_PAR_DEFAUT, help="classeur source (feuilles de données)")
     parser.add_argument("--sortie", type=Path, help="classeur à écrire (défaut : remplace --excel)")
     args = parser.parse_args()
     construire(args.excel, args.sortie or args.excel)
